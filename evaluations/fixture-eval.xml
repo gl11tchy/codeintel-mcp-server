@@ -1,0 +1,42 @@
+<evaluation>
+  <qa_pair>
+    <question>In the TypeScript fixture, one method both mutates a running numeric total and calls a helper that adds two numbers. What is that method's fully qualified name?</question>
+    <answer>Calculator.addToTotal</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the TypeScript fixture, what exact version string is exported as a constant? Respond with the string only.</question>
+    <answer>1.0.0</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the TypeScript fixture, which imported class is instantiated inside the function named run? Answer with the class name only.</question>
+    <answer>Calculator</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the React fixture, which helper function is called to build the rendered greeting text? Answer with the function name only.</question>
+    <answer>formatGreeting</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the React fixture, which file defines the component that accepts a name prop and renders a section element? Answer with the relative file path only.</question>
+    <answer>src/components/Greeter.tsx</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the Python fixture, which method does Greeter.greet call before the string is normalized? Answer with the fully qualified method name only.</question>
+    <answer>Greeter.format</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the Python fixture, which top-level function imports and calls slugify directly? Answer with the function name only.</question>
+    <answer>make_slug</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the Python fixture, what single character replaces spaces in the output of slugify? Answer with that character only.</question>
+    <answer>-</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>Across the indexed fixtures, which fully qualified Python symbol is responsible for the final normalization step before a greeting string is returned? Answer with the symbol name only.</question>
+    <answer>slugify</answer>
+  </qa_pair>
+  <qa_pair>
+    <question>In the TypeScript fixture, which arithmetic helper multiplies its two inputs? Answer with the function name only.</question>
+    <answer>multiply</answer>
+  </qa_pair>
+</evaluation>

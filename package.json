@@ -1,0 +1,45 @@
+{
+  "name": "codeintel-mcp-server",
+  "version": "0.1.0",
+  "description": "Local-first MCP server for symbol navigation, references, and call graph exploration.",
+  "type": "module",
+  "bin": {
+    "codeintel-mcp-server": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist coverage .vitest",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "start:stdio": "node dist/index.js --transport stdio",
+    "start:http": "node dist/index.js --transport http",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "better-sqlite3": "^12.4.1",
+    "chokidar": "^4.0.3",
+    "env-paths": "^3.0.0",
+    "express": "^5.1.0",
+    "fast-glob": "^3.3.3",
+    "ignore": "^7.0.5",
+    "minimatch": "^10.0.3",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-javascript": "^0.21.4",
+    "tree-sitter-python": "^0.21.0",
+    "tree-sitter-typescript": "^0.21.2",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
