@@ -21,6 +21,32 @@ CodeIntel is built to sit in the useful middle:
 
 It is optimized for personal, local workflows first, with a clean path to remote deployment through Streamable HTTP.
 
+## Quick Start
+
+### 1. Install
+
+```bash
+npm install
+npm run build
+```
+
+### 2. Run over stdio
+
+```bash
+node dist/index.js --transport stdio
+```
+
+### 3. Or run local Streamable HTTP
+
+```bash
+node dist/index.js --transport http --host 127.0.0.1 --port 3333
+```
+
+Optional runtime flags:
+
+- `--db-path /custom/path/codeintel.sqlite`
+- `--disable-watch`
+
 ## Highlights
 
 | Capability | What you get |
@@ -58,32 +84,6 @@ It is optimized for personal, local workflows first, with a clean path to remote
 | `codeintel_find_references` | Find resolved references to a symbol |
 | `codeintel_find_callers` | Traverse incoming call edges |
 | `codeintel_find_callees` | Traverse outgoing call edges |
-
-## Quick Start
-
-### 1. Install
-
-```bash
-npm install
-npm run build
-```
-
-### 2. Run over stdio
-
-```bash
-node dist/index.js --transport stdio
-```
-
-### 3. Or run local Streamable HTTP
-
-```bash
-node dist/index.js --transport http --host 127.0.0.1 --port 3333
-```
-
-Optional runtime flags:
-
-- `--db-path /custom/path/codeintel.sqlite`
-- `--disable-watch`
 
 ## MCP Client Config
 
