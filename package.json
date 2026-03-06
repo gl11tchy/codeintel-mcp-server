@@ -2,10 +2,33 @@
   "name": "codeintel-mcp-server",
   "version": "0.1.0",
   "description": "Local-first MCP server for symbol navigation, references, and call graph exploration.",
+  "license": "MIT",
   "type": "module",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "bin": {
     "codeintel-mcp-server": "./dist/index.js"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gl11tchy/codeintel-mcp-server.git"
+  },
+  "homepage": "https://github.com/gl11tchy/codeintel-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/gl11tchy/codeintel-mcp-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "code-intelligence",
+    "code-search",
+    "tree-sitter",
+    "typescript",
+    "developer-tools"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist coverage .vitest",

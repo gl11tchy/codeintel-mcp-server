@@ -183,4 +183,4 @@ Fixture-based read-only evaluation prompts live in [`evaluations/fixture-eval.xm
 
 ## License
 
-No license file has been added yet. If you want this repo to be shareable outside your account, add a license before making it public.
+MIT. See [LICENSE](./LICENSE).
