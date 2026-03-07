@@ -657,13 +657,17 @@ export class CodeIntelService {
     const dirty = this.detectDirtyWorkspace(workspace);
 
     try {
+      const changedRelPaths = dirty.changedAbsolutePaths.map(
+        (absPath) => relativeWorkspacePath(workspace.rootPath, absPath),
+      );
       for (const absolutePath of dirty.changedAbsolutePaths) {
         this.indexAbsoluteFile(workspace, absolutePath);
       }
       for (const filePath of dirty.removedFilePaths) {
         this.store.removeFile(workspace.workspaceId, filePath);
       }
-      this.rebuildRelations(workspace);
+      const allChangedPaths = [...changedRelPaths, ...dirty.removedFilePaths];
+      this.rebuildRelationsForFiles(workspace, allChangedPaths);
       this.store.updateWorkspaceCounts(workspace.workspaceId);
       this.store.setWorkspaceRevision(workspace.workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
       this.store.setWorkspaceWatchState(workspace.workspaceId, this.enableWatch ? "watching" : "indexed", null);
@@ -780,9 +784,7 @@ export class CodeIntelService {
     this.store.saveIndexedFile(indexedFile, parsed.symbols);
   }
 
-  private rebuildRelations(workspace: WorkspaceConfig): void {
-    const files = this.store.getFiles(workspace.workspaceId);
-    const symbols = this.store.getSymbols(workspace.workspaceId);
+  private buildLookupMaps(files: IndexedFile[], symbols: CodeSymbol[]) {
     const filesByPath = new Map(files.map((file) => [file.filePath, file] as const));
     const knownFiles = new Set(files.map((file) => file.filePath));
     const symbolsById = new Map(symbols.map((symbol) => [symbol.id, symbol] as const));
@@ -810,81 +812,135 @@ export class CodeIntelService {
       }
     }
 
+    return { filesByPath, knownFiles, symbolsById, symbolsByName, symbolsByFileAndName, methodsByClassId };
+  }
+
+  private resolveFileRelations(
+    workspace: WorkspaceConfig,
+    file: IndexedFile,
+    maps: ReturnType<CodeIntelService["buildLookupMaps"]>,
+    referenceDedup: Set<string>,
+    callDedup: Set<string>,
+  ): { references: ResolvedReference[]; calls: ResolvedCall[] } {
+    const references: ResolvedReference[] = [];
+    const calls: ResolvedCall[] = [];
+
+    const bindings = this.resolveBindings(workspace, file, maps.knownFiles, maps.filesByPath, maps.symbolsByFileAndName);
+    for (const binding of bindings.values()) {
+      if (!binding.targetSymbolId) {
+        continue;
+      }
+      const key = `${file.filePath}:${binding.binding.line}:${binding.binding.column}:${binding.targetSymbolId}:import`;
+      if (referenceDedup.has(key)) {
+        continue;
+      }
+      referenceDedup.add(key);
+      references.push({
+        workspaceId: workspace.workspaceId,
+        filePath: file.filePath,
+        targetSymbolId: binding.targetSymbolId,
+        referencedName: binding.binding.importedName,
+        qualifier: null,
+        enclosingSymbolId: null,
+        line: binding.binding.line,
+        column: binding.binding.column,
+        context: binding.binding.context,
+        confidence: binding.confidence,
+        reason: binding.reason,
+        role: "import",
+      });
+    }
+
+    for (const reference of file.references) {
+      const resolved = this.resolveReference(
+        workspace.workspaceId,
+        file.filePath,
+        reference,
+        bindings,
+        maps.symbolsById,
+        maps.symbolsByName,
+        maps.symbolsByFileAndName,
+        maps.methodsByClassId,
+      );
+      if (!resolved.targetSymbolId) {
+        continue;
+      }
+      const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.targetSymbolId}:${resolved.role}`;
+      if (referenceDedup.has(key)) {
+        continue;
+      }
+      referenceDedup.add(key);
+      references.push(resolved);
+    }
+
+    for (const call of file.calls) {
+      const resolved = this.resolveCall(
+        workspace.workspaceId,
+        file.filePath,
+        call,
+        bindings,
+        maps.symbolsById,
+        maps.symbolsByName,
+        maps.symbolsByFileAndName,
+        maps.methodsByClassId,
+      );
+      const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.callerSymbolId}:${resolved.calleeSymbolId ?? resolved.calleeName}`;
+      if (callDedup.has(key)) {
+        continue;
+      }
+      callDedup.add(key);
+      calls.push(resolved);
+    }
+
+    return { references, calls };
+  }
+
+  private rebuildRelations(workspace: WorkspaceConfig): void {
+    const files = this.store.getFiles(workspace.workspaceId);
+    const symbols = this.store.getSymbols(workspace.workspaceId);
+    const maps = this.buildLookupMaps(files, symbols);
+
     const references: ResolvedReference[] = [];
     const calls: ResolvedCall[] = [];
     const referenceDedup = new Set<string>();
     const callDedup = new Set<string>();
 
     for (const file of files) {
-      const bindings = this.resolveBindings(workspace, file, knownFiles, filesByPath, symbolsByFileAndName);
-      for (const binding of bindings.values()) {
-        if (!binding.targetSymbolId) {
-          continue;
-        }
-        const key = `${file.filePath}:${binding.binding.line}:${binding.binding.column}:${binding.targetSymbolId}:import`;
-        if (referenceDedup.has(key)) {
-          continue;
-        }
-        referenceDedup.add(key);
-        references.push({
-          workspaceId: workspace.workspaceId,
-          filePath: file.filePath,
-          targetSymbolId: binding.targetSymbolId,
-          referencedName: binding.binding.importedName,
-          qualifier: null,
-          enclosingSymbolId: null,
-          line: binding.binding.line,
-          column: binding.binding.column,
-          context: binding.binding.context,
-          confidence: binding.confidence,
-          reason: binding.reason,
-          role: "import",
-        });
-      }
-
-      for (const reference of file.references) {
-        const resolved = this.resolveReference(
-          workspace.workspaceId,
-          file.filePath,
-          reference,
-          bindings,
-          symbolsById,
-          symbolsByName,
-          symbolsByFileAndName,
-          methodsByClassId,
-        );
-        if (!resolved.targetSymbolId) {
-          continue;
-        }
-        const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.targetSymbolId}:${resolved.role}`;
-        if (referenceDedup.has(key)) {
-          continue;
-        }
-        referenceDedup.add(key);
-        references.push(resolved);
-      }
-
-      for (const call of file.calls) {
-        const resolved = this.resolveCall(
-          workspace.workspaceId,
-          file.filePath,
-          call,
-          bindings,
-          symbolsById,
-          symbolsByName,
-          symbolsByFileAndName,
-          methodsByClassId,
-        );
-        const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.callerSymbolId}:${resolved.calleeSymbolId ?? resolved.calleeName}`;
-        if (callDedup.has(key)) {
-          continue;
-        }
-        callDedup.add(key);
-        calls.push(resolved);
-      }
+      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
+      references.push(...result.references);
+      calls.push(...result.calls);
     }
 
     this.store.replaceResolvedRelations(workspace.workspaceId, references, calls);
+  }
+
+  private rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[]): void {
+    if (changedFilePaths.length === 0) return;
+
+    const dependentPaths = this.store.getFilesThatImportFrom(workspace.workspaceId, changedFilePaths);
+    const allAffectedPaths = [...new Set([...changedFilePaths, ...dependentPaths])];
+
+    this.store.deleteRelationsForFiles(workspace.workspaceId, allAffectedPaths);
+
+    const allFiles = this.store.getFiles(workspace.workspaceId);
+    const allSymbols = this.store.getSymbols(workspace.workspaceId);
+    const maps = this.buildLookupMaps(allFiles, allSymbols);
+
+    const affectedSet = new Set(allAffectedPaths);
+    const affectedFiles = allFiles.filter((f) => affectedSet.has(f.filePath));
+
+    const references: ResolvedReference[] = [];
+    const calls: ResolvedCall[] = [];
+    const referenceDedup = new Set<string>();
+    const callDedup = new Set<string>();
+
+    for (const file of affectedFiles) {
+      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
+      references.push(...result.references);
+      calls.push(...result.calls);
+    }
+
+    this.store.insertResolvedRelations(references, calls);
   }
 
   private resolveBindings(
@@ -1158,6 +1214,7 @@ export class CodeIntelService {
     this.store.setWorkspaceWatchState(workspaceId, "indexing", null);
 
     try {
+      const changedPaths: string[] = [];
       for (const [absolutePath, operation] of queued) {
         const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
         if (relativePath === ".git/HEAD") {
@@ -1165,15 +1222,17 @@ export class CodeIntelService {
           return;
         }
         if (operation === "unlink") {
+          changedPaths.push(relativePath);
           this.store.removeFile(workspaceId, relativePath);
           continue;
         }
         if (!fs.existsSync(absolutePath)) {
           continue;
         }
+        changedPaths.push(relativePath);
         this.indexAbsoluteFile(workspace, absolutePath);
       }
-      this.rebuildRelations(workspace);
+      this.rebuildRelationsForFiles(workspace, changedPaths);
       this.store.updateWorkspaceCounts(workspaceId);
       this.store.setWorkspaceRevision(workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
       this.store.setWorkspaceWatchState(workspaceId, "watching", null);

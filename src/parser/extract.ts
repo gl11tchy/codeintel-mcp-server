@@ -244,156 +244,276 @@ function maybeCreatePythonSymbol(
   };
 }
 
-function extractJsImports(content: string): ImportBinding[] {
-  const bindings: ImportBinding[] = [];
-  const lines = content.split(/\r?\n/);
+function extractModuleSpecifier(sourceNode: SyntaxNode): string {
+  const fragment = sourceNode.namedChildren.find((child) => child.type === "string_fragment");
+  return fragment ? fragment.text : sourceNode.text.replace(/^['"]|['"]$/g, "");
+}
 
-  lines.forEach((line, index) => {
-    const namedMatch = line.match(/import\s+(?:([A-Za-z_$][\w$]*)\s*,\s*)?\{([^}]+)\}\s+from\s+["'](.+?)["']/);
-    if (namedMatch) {
-      const [, defaultName, specifierList, moduleSpecifier] = namedMatch;
-      if (defaultName) {
+function extractJsImportsFromTree(rootNode: SyntaxNode, content: string): ImportBinding[] {
+  const bindings: ImportBinding[] = [];
+
+  for (const node of rootNode.children) {
+    if (node.type === "import_statement") {
+      const sourceNode = node.childForFieldName("source");
+      if (!sourceNode) {
+        continue;
+      }
+      const moduleSpecifier = extractModuleSpecifier(sourceNode);
+      const importClause = node.children.find((child) => child.type === "import_clause");
+      if (!importClause) {
+        continue;
+      }
+
+      for (const clauseChild of importClause.children) {
+        if (clauseChild.type === "identifier") {
+          // Default import: `import Foo from 'module'`
+          bindings.push({
+            localName: clauseChild.text,
+            importedName: "default",
+            moduleSpecifier,
+            kind: "default",
+            line: clauseChild.startPosition.row + 1,
+            column: clauseChild.startPosition.column + 1,
+            context: getLine(content, clauseChild.startPosition.row + 1).trim(),
+          });
+        } else if (clauseChild.type === "namespace_import") {
+          // Namespace import: `import * as ns from 'module'`
+          const identNode = clauseChild.namedChildren.find((child) => child.type === "identifier");
+          if (identNode) {
+            bindings.push({
+              localName: identNode.text,
+              importedName: "*",
+              moduleSpecifier,
+              kind: "namespace",
+              line: identNode.startPosition.row + 1,
+              column: identNode.startPosition.column + 1,
+              context: getLine(content, identNode.startPosition.row + 1).trim(),
+            });
+          }
+        } else if (clauseChild.type === "named_imports") {
+          // Named imports: `import { foo, bar as baz } from 'module'`
+          for (const specifier of clauseChild.namedChildren) {
+            if (specifier.type !== "import_specifier") {
+              continue;
+            }
+            const nameNode = specifier.childForFieldName("name");
+            const aliasNode = specifier.childForFieldName("alias");
+            if (!nameNode) {
+              continue;
+            }
+            const localNode = aliasNode ?? nameNode;
+            bindings.push({
+              localName: localNode.text,
+              importedName: nameNode.text,
+              moduleSpecifier,
+              kind: "named",
+              line: localNode.startPosition.row + 1,
+              column: localNode.startPosition.column + 1,
+              context: getLine(content, localNode.startPosition.row + 1).trim(),
+            });
+          }
+        }
+      }
+    } else if (node.type === "export_statement") {
+      // Re-exports: `export { foo } from './bar'` or `export * from './baz'`
+      const sourceNode = node.childForFieldName("source");
+      if (!sourceNode) {
+        continue;
+      }
+      const moduleSpecifier = extractModuleSpecifier(sourceNode);
+
+      const exportClause = node.children.find((child) => child.type === "export_clause");
+      if (exportClause) {
+        for (const specifier of exportClause.namedChildren) {
+          if (specifier.type !== "export_specifier") {
+            continue;
+          }
+          const nameNode = specifier.childForFieldName("name");
+          const aliasNode = specifier.childForFieldName("alias");
+          if (!nameNode) {
+            continue;
+          }
+          const localNode = aliasNode ?? nameNode;
+          bindings.push({
+            localName: localNode.text,
+            importedName: nameNode.text,
+            moduleSpecifier,
+            kind: "named",
+            line: localNode.startPosition.row + 1,
+            column: localNode.startPosition.column + 1,
+            context: getLine(content, localNode.startPosition.row + 1).trim(),
+          });
+        }
+      } else if (node.children.some((child) => child.type === "*")) {
+        // `export * from './baz'`
+        const starNode = node.children.find((child) => child.type === "*")!;
         bindings.push({
-          localName: defaultName,
-          importedName: "default",
+          localName: "*",
+          importedName: "*",
           moduleSpecifier,
-          kind: "default",
-          line: index + 1,
-          column: line.indexOf(defaultName) + 1,
-          context: line.trim(),
+          kind: "namespace",
+          line: starNode.startPosition.row + 1,
+          column: starNode.startPosition.column + 1,
+          context: getLine(content, starNode.startPosition.row + 1).trim(),
         });
       }
-      specifierList.split(",").forEach((entry) => {
-        const [importedRaw, aliasRaw] = entry.split(/\s+as\s+/).map((part) => part.trim()).filter(Boolean);
-        if (!importedRaw) {
-          return;
+    } else if (node.type === "lexical_declaration") {
+      // require() calls: `const { a, b } = require('mod')` or `const x = require('mod')`
+      for (const declarator of node.namedChildren) {
+        if (declarator.type !== "variable_declarator") {
+          continue;
         }
-        const localName = aliasRaw || importedRaw;
-        bindings.push({
-          localName,
-          importedName: importedRaw,
-          moduleSpecifier,
-          kind: "named",
-          line: index + 1,
-          column: line.indexOf(localName) + 1,
-          context: line.trim(),
-        });
-      });
-      return;
-    }
-
-    const namespaceMatch = line.match(/import\s+\*\s+as\s+([A-Za-z_$][\w$]*)\s+from\s+["'](.+?)["']/);
-    if (namespaceMatch) {
-      const [, localName, moduleSpecifier] = namespaceMatch;
-      bindings.push({
-        localName,
-        importedName: "*",
-        moduleSpecifier,
-        kind: "namespace",
-        line: index + 1,
-        column: line.indexOf(localName) + 1,
-        context: line.trim(),
-      });
-      return;
-    }
-
-    const defaultMatch = line.match(/import\s+([A-Za-z_$][\w$]*)\s+from\s+["'](.+?)["']/);
-    if (defaultMatch) {
-      const [, localName, moduleSpecifier] = defaultMatch;
-      bindings.push({
-        localName,
-        importedName: "default",
-        moduleSpecifier,
-        kind: "default",
-        line: index + 1,
-        column: line.indexOf(localName) + 1,
-        context: line.trim(),
-      });
-      return;
-    }
-
-    const requireNamedMatch = line.match(/const\s+\{([^}]+)\}\s*=\s*require\(["'](.+?)["']\)/);
-    if (requireNamedMatch) {
-      const [, specifierList, moduleSpecifier] = requireNamedMatch;
-      specifierList.split(",").forEach((entry) => {
-        const [importedRaw, aliasRaw] = entry.split(/\s*:\s*|\s+as\s+/).map((part) => part.trim()).filter(Boolean);
-        if (!importedRaw) {
-          return;
+        const nameNode = declarator.childForFieldName("name");
+        const valueNode = declarator.childForFieldName("value");
+        if (!nameNode || !valueNode || valueNode.type !== "call_expression") {
+          continue;
         }
-        const localName = aliasRaw || importedRaw;
-        bindings.push({
-          localName,
-          importedName: importedRaw,
-          moduleSpecifier,
-          kind: "named",
-          line: index + 1,
-          column: line.indexOf(localName) + 1,
-          context: line.trim(),
-        });
-      });
-      return;
-    }
+        const fnNode = valueNode.childForFieldName("function");
+        if (!fnNode || fnNode.text !== "require") {
+          continue;
+        }
+        const argsNode = valueNode.childForFieldName("arguments");
+        const firstArg = argsNode?.namedChildren[0];
+        if (!firstArg || firstArg.type !== "string") {
+          continue;
+        }
+        const moduleSpecifier = extractModuleSpecifier(firstArg);
 
-    const requireDefaultMatch = line.match(/const\s+([A-Za-z_$][\w$]*)\s*=\s*require\(["'](.+?)["']\)/);
-    if (requireDefaultMatch) {
-      const [, localName, moduleSpecifier] = requireDefaultMatch;
-      bindings.push({
-        localName,
-        importedName: "default",
-        moduleSpecifier,
-        kind: "default",
-        line: index + 1,
-        column: line.indexOf(localName) + 1,
-        context: line.trim(),
-      });
+        if (nameNode.type === "object_pattern") {
+          // Destructured require: `const { a, b: aliasB } = require('mod')`
+          for (const prop of nameNode.children) {
+            if (prop.type === "shorthand_property_identifier_pattern") {
+              bindings.push({
+                localName: prop.text,
+                importedName: prop.text,
+                moduleSpecifier,
+                kind: "named",
+                line: prop.startPosition.row + 1,
+                column: prop.startPosition.column + 1,
+                context: getLine(content, prop.startPosition.row + 1).trim(),
+              });
+            } else if (prop.type === "pair_pattern") {
+              const keyNode = prop.children.find((child) => child.type === "property_identifier");
+              const valNode = prop.children.find((child) => child.type === "identifier");
+              if (keyNode && valNode) {
+                bindings.push({
+                  localName: valNode.text,
+                  importedName: keyNode.text,
+                  moduleSpecifier,
+                  kind: "named",
+                  line: valNode.startPosition.row + 1,
+                  column: valNode.startPosition.column + 1,
+                  context: getLine(content, valNode.startPosition.row + 1).trim(),
+                });
+              }
+            }
+          }
+        } else if (nameNode.type === "identifier") {
+          // Default require: `const x = require('mod')`
+          bindings.push({
+            localName: nameNode.text,
+            importedName: "default",
+            moduleSpecifier,
+            kind: "default",
+            line: nameNode.startPosition.row + 1,
+            column: nameNode.startPosition.column + 1,
+            context: getLine(content, nameNode.startPosition.row + 1).trim(),
+          });
+        }
+      }
     }
-  });
+  }
 
   return bindings;
 }
 
-function extractPythonImports(content: string): ImportBinding[] {
+function extractPythonImportsFromTree(rootNode: SyntaxNode, content: string): ImportBinding[] {
   const bindings: ImportBinding[] = [];
-  const lines = content.split(/\r?\n/);
 
-  lines.forEach((line, index) => {
-    const fromMatch = line.match(/from\s+([.\w]+)\s+import\s+(.+)/);
-    if (fromMatch) {
-      const [, moduleSpecifier, importList] = fromMatch;
-      importList.split(",").forEach((entry) => {
-        const [importedRaw, aliasRaw] = entry.split(/\s+as\s+/).map((part) => part.trim()).filter(Boolean);
-        if (!importedRaw) {
-          return;
+  for (const node of rootNode.children) {
+    if (node.type === "import_from_statement") {
+      // `from module import foo, bar` or `from module import *`
+      const firstNamed = node.namedChildren[0];
+      if (!firstNamed) {
+        continue;
+      }
+      const moduleSpecifier = firstNamed.text;
+
+      for (const imported of node.namedChildren.slice(1)) {
+        if (imported.type === "dotted_name") {
+          const importedName = imported.text;
+          bindings.push({
+            localName: importedName,
+            importedName,
+            moduleSpecifier,
+            kind: "named",
+            line: imported.startPosition.row + 1,
+            column: imported.startPosition.column + 1,
+            context: getLine(content, imported.startPosition.row + 1).trim(),
+          });
+        } else if (imported.type === "aliased_import") {
+          const nameNode = imported.childForFieldName("name");
+          const aliasNode = imported.childForFieldName("alias");
+          if (nameNode) {
+            const localNode = aliasNode ?? nameNode;
+            bindings.push({
+              localName: localNode.text,
+              importedName: nameNode.text,
+              moduleSpecifier,
+              kind: "named",
+              line: localNode.startPosition.row + 1,
+              column: localNode.startPosition.column + 1,
+              context: getLine(content, localNode.startPosition.row + 1).trim(),
+            });
+          }
+        } else if (imported.type === "wildcard_import") {
+          bindings.push({
+            localName: "*",
+            importedName: "*",
+            moduleSpecifier,
+            kind: "namespace",
+            line: imported.startPosition.row + 1,
+            column: imported.startPosition.column + 1,
+            context: getLine(content, imported.startPosition.row + 1).trim(),
+          });
         }
-        const localName = aliasRaw || importedRaw;
-        bindings.push({
-          localName,
-          importedName: importedRaw,
-          moduleSpecifier,
-          kind: "named",
-          line: index + 1,
-          column: line.indexOf(localName) + 1,
-          context: line.trim(),
-        });
-      });
-      return;
+      }
+    } else if (node.type === "import_statement") {
+      // `import module` or `import module as alias`
+      for (const child of node.namedChildren) {
+        if (child.type === "dotted_name") {
+          const moduleSpecifier = child.text;
+          const localName = moduleSpecifier.split(".").at(-1) ?? moduleSpecifier;
+          bindings.push({
+            localName,
+            importedName: localName,
+            moduleSpecifier,
+            kind: "namespace",
+            line: child.startPosition.row + 1,
+            column: child.startPosition.column + 1,
+            context: getLine(content, child.startPosition.row + 1).trim(),
+          });
+        } else if (child.type === "aliased_import") {
+          const nameNode = child.childForFieldName("name");
+          const aliasNode = child.childForFieldName("alias");
+          if (nameNode) {
+            const moduleSpecifier = nameNode.text;
+            const localNode = aliasNode ?? nameNode;
+            const localName = localNode.text;
+            bindings.push({
+              localName,
+              importedName: moduleSpecifier.split(".").at(-1) ?? moduleSpecifier,
+              moduleSpecifier,
+              kind: "namespace",
+              line: localNode.startPosition.row + 1,
+              column: localNode.startPosition.column + 1,
+              context: getLine(content, localNode.startPosition.row + 1).trim(),
+            });
+          }
+        }
+      }
     }
-
-    const importMatch = line.match(/import\s+([.\w]+)(?:\s+as\s+([A-Za-z_]\w*))?/);
-    if (importMatch) {
-      const [, moduleSpecifier, alias] = importMatch;
-      const localName = alias || moduleSpecifier.split(".").at(-1) || moduleSpecifier;
-      bindings.push({
-        localName,
-        importedName: moduleSpecifier.split(".").at(-1) || moduleSpecifier,
-        moduleSpecifier,
-        kind: "namespace",
-        line: index + 1,
-        column: line.indexOf(localName) + 1,
-        context: line.trim(),
-      });
-    }
-  });
+  }
 
   return bindings;
 }
@@ -601,7 +721,7 @@ function parseJsLike(
   const tree = parser.parse(content);
   const counts = new Map<string, number>();
   const symbols: CodeSymbol[] = [];
-  const imports = extractJsImports(content);
+  const imports = extractJsImportsFromTree(tree.rootNode, content);
   const references: RawReference[] = [];
   const calls: RawCall[] = [];
 
@@ -662,7 +782,7 @@ function parsePython(
   const tree = parser.parse(content);
   const counts = new Map<string, number>();
   const symbols: CodeSymbol[] = [];
-  const imports = extractPythonImports(content);
+  const imports = extractPythonImportsFromTree(tree.rootNode, content);
   const references: RawReference[] = [];
   const calls: RawCall[] = [];
 

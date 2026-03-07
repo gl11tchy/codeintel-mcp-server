@@ -631,6 +631,80 @@ export class Store {
     transaction();
   }
 
+  insertResolvedRelations(references: ResolvedReference[], calls: ResolvedCall[]): void {
+    if (references.length === 0 && calls.length === 0) return;
+
+    const transaction = this.db.transaction(() => {
+      const insertReference = this.db.prepare(`
+        INSERT INTO references_resolved (
+          workspace_id,
+          file_path,
+          target_symbol_id,
+          referenced_name,
+          qualifier,
+          enclosing_symbol_id,
+          line,
+          column,
+          context,
+          confidence,
+          reason,
+          role
+        ) VALUES (
+          @workspaceId,
+          @filePath,
+          @targetSymbolId,
+          @referencedName,
+          @qualifier,
+          @enclosingSymbolId,
+          @line,
+          @column,
+          @context,
+          @confidence,
+          @reason,
+          @role
+        )
+      `);
+
+      const insertCall = this.db.prepare(`
+        INSERT INTO calls_resolved (
+          workspace_id,
+          file_path,
+          caller_symbol_id,
+          callee_symbol_id,
+          callee_name,
+          qualifier,
+          line,
+          column,
+          context,
+          confidence,
+          reason
+        ) VALUES (
+          @workspaceId,
+          @filePath,
+          @callerSymbolId,
+          @calleeSymbolId,
+          @calleeName,
+          @qualifier,
+          @line,
+          @column,
+          @context,
+          @confidence,
+          @reason
+        )
+      `);
+
+      for (const reference of references) {
+        insertReference.run(reference);
+      }
+
+      for (const call of calls) {
+        insertCall.run(call);
+      }
+    });
+
+    transaction();
+  }
+
   getReferencesForSymbol(workspaceId: string, symbolId: string): ResolvedReference[] {
     return this.db
       .prepare(
@@ -795,6 +869,39 @@ export class Store {
       calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     }));
+  }
+
+  deleteRelationsForFiles(workspaceId: string, filePaths: string[]): void {
+    if (filePaths.length === 0) return;
+
+    const transaction = this.db.transaction(() => {
+      const placeholders = filePaths.map(() => "?").join(",");
+      this.db
+        .prepare(`DELETE FROM references_resolved WHERE workspace_id = ? AND file_path IN (${placeholders})`)
+        .run(workspaceId, ...filePaths);
+      this.db
+        .prepare(`DELETE FROM calls_resolved WHERE workspace_id = ? AND file_path IN (${placeholders})`)
+        .run(workspaceId, ...filePaths);
+    });
+    transaction();
+  }
+
+  getFilesThatImportFrom(workspaceId: string, targetFilePaths: string[]): string[] {
+    if (targetFilePaths.length === 0) return [];
+
+    const targetSet = new Set(targetFilePaths);
+    const likeClauses = targetFilePaths.map(() => "imports_json LIKE ?").join(" OR ");
+    const likeParams = targetFilePaths.map((fp) => `%${fp}%`);
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT file_path FROM files WHERE workspace_id = ? AND (${likeClauses})`,
+      )
+      .all(workspaceId, ...likeParams) as Array<{ file_path: string }>;
+
+    return rows
+      .map((row) => row.file_path)
+      .filter((fp) => !targetSet.has(fp));
   }
 
   private mapWorkspace(row: WorkspaceRow): WorkspaceRecord {
