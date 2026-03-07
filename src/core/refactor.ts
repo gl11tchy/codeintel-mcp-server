@@ -154,8 +154,8 @@ export class Refactor {
     // Check if target file already has a symbol with the same name
     if (fs.existsSync(targetAbsolutePath)) {
       const targetContent = fs.readFileSync(targetAbsolutePath, "utf8");
-      // Simple check: look for the symbol name as a declaration
-      const namePattern = new RegExp(`\\b(function|class|const|let|var|type|interface)\\s+${symbol.name}\\b`);
+      const escapedName = symbol.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const namePattern = new RegExp(`\\b(function|class|const|let|var|type|interface)\\s+${escapedName}\\b`);
       if (namePattern.test(targetContent)) {
         warnings.push(`Target file already contains a symbol named '${symbol.name}'`);
       }
@@ -289,51 +289,59 @@ export class Refactor {
     for (const [filePath, fileEdits] of editsByFile) {
       const absolutePath = path.join(workspaceRoot, filePath);
 
-      for (const edit of fileEdits) {
+      // Read the file once (or start empty for new files)
+      let lines: string[];
+      let fileExists = fs.existsSync(absolutePath);
+      if (fileExists) {
+        lines = fs.readFileSync(absolutePath, "utf8").split("\n");
+      } else {
+        lines = [];
+      }
+
+      // Sort edits by line descending so removals don't shift subsequent targets
+      const sorted = [...fileEdits].sort((a, b) => b.line - a.line);
+
+      for (const edit of sorted) {
         switch (edit.action) {
           case "remove_lines": {
-            if (!fs.existsSync(absolutePath)) continue;
-            const content = fs.readFileSync(absolutePath, "utf8");
-            const lines = content.split("\n");
+            if (!fileExists) continue;
             const endLine = edit.endLine ?? edit.line;
-            // Remove the lines and any trailing blank line
             const before = lines.slice(0, edit.line - 1);
             const after = lines.slice(endLine);
-            // Remove a leading blank line from 'after' if present (clean up spacing)
             if (after.length > 0 && after[0].trim() === "") {
               after.shift();
             }
-            fs.writeFileSync(absolutePath, before.concat(after).join("\n"), "utf8");
-            break;
-          }
-          case "insert_lines": {
-            if (fs.existsSync(absolutePath)) {
-              const content = fs.readFileSync(absolutePath, "utf8");
-              const newContent = content.trimEnd() + "\n\n" + edit.newText + "\n";
-              fs.writeFileSync(absolutePath, newContent, "utf8");
-            } else {
-              // Create the file
-              const dir = path.dirname(absolutePath);
-              if (!fs.existsSync(dir)) {
-                fs.mkdirSync(dir, { recursive: true });
-              }
-              fs.writeFileSync(absolutePath, edit.newText + "\n", "utf8");
-            }
+            lines = before.concat(after);
             break;
           }
           case "replace_import": {
-            if (!fs.existsSync(absolutePath)) continue;
-            const content = fs.readFileSync(absolutePath, "utf8");
-            const lines = content.split("\n");
+            if (!fileExists) continue;
             const lineIndex = edit.line - 1;
             if (lineIndex >= 0 && lineIndex < lines.length && edit.oldText) {
               lines[lineIndex] = edit.newText;
             }
-            fs.writeFileSync(absolutePath, lines.join("\n"), "utf8");
+            break;
+          }
+          case "insert_lines": {
+            if (fileExists || lines.length > 0) {
+              const content = lines.join("\n").trimEnd() + "\n\n" + edit.newText + "\n";
+              lines = content.split("\n");
+            } else {
+              lines = (edit.newText + "\n").split("\n");
+            }
             break;
           }
         }
       }
+
+      // Write the file once after all edits
+      if (!fileExists) {
+        const dir = path.dirname(absolutePath);
+        if (!fs.existsSync(dir)) {
+          fs.mkdirSync(dir, { recursive: true });
+        }
+      }
+      fs.writeFileSync(absolutePath, lines.join("\n"), "utf8");
     }
   }
 
