@@ -125,13 +125,22 @@ export class Refactor {
     // Use the canonical workspace-relative path everywhere
     const canonicalTarget = path.relative(normalizedRoot, targetAbsolutePath).split(path.sep).join("/");
 
-    if (!languageFromFilePath(canonicalTarget)) {
+    const targetLanguage = languageFromFilePath(canonicalTarget);
+    if (!targetLanguage) {
       throw new Error(`Target file has no indexable extension: ${canonicalTarget}`);
     }
 
     const symbol = this.store.getSymbol(symbolId);
     if (!symbol || symbol.workspaceId !== workspaceId) {
       throw new Error(`Symbol not found: ${symbolId}`);
+    }
+
+    const sourceLanguage = symbol.language;
+    const jsFamily = new Set(["javascript", "typescript", "tsx"]);
+    const compatible = targetLanguage === sourceLanguage
+      || (jsFamily.has(targetLanguage) && jsFamily.has(sourceLanguage));
+    if (!compatible) {
+      throw new Error(`Symbol language '${sourceLanguage}' is incompatible with target language '${targetLanguage}'`);
     }
 
     const sourceFilePath = symbol.filePath;
@@ -245,7 +254,7 @@ export class Refactor {
 
     // Match default import: "import Foo" or "import Foo," (before { or from)
     const defaultMatch = importLine.match(/import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,|\s+from)/);
-    if (defaultMatch && defaultMatch[1] !== "type") {
+    if (defaultMatch) {
       names.push(defaultMatch[1]);
     }
 
