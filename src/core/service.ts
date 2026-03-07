@@ -1,44 +1,15 @@
-import fs from "node:fs";
 import path from "node:path";
 
-import chokidar, { type FSWatcher } from "chokidar";
-import fg from "fast-glob";
-import ignore from "ignore";
 import { minimatch } from "minimatch";
 
 import { Store } from "../db/store.js";
-import { parseFile } from "../parser/extract.js";
-import {
-  DEFAULT_EXCLUDE_GLOBS,
-  MAX_FILE_BYTES,
-  ensureDir,
-  estimateTokens,
-  findGitRoot,
-  getLine,
-  getPaths,
-  hashText,
-  isBinaryContent,
-  isSecretLikePath,
-  languageFromFilePath,
-  readGitRevision,
-  relativeWorkspacePath,
-  resolveJsImport,
-  resolvePythonModule,
-  stableWorkspaceId,
-} from "./utils.js";
 import type {
   CodeSymbol,
   Confidence,
   FileTreeNode,
-  IndexedFile,
-  ImportBinding,
   MetaEnvelope,
   OutlineNode,
   PaginationEnvelope,
-  RawCall,
-  RawReference,
-  ResolvedCall,
-  ResolvedReference,
   SearchSymbolFilters,
   SearchTextFilters,
   SupportedLanguage,
@@ -47,26 +18,16 @@ import type {
   WorkspaceRecord,
   WorkspaceSummary,
 } from "../types.js";
-
-interface WorkspaceWatchState {
-  watcher: FSWatcher;
-  queuedChanges: Map<string, "change" | "unlink">;
-  fullRefreshQueued: boolean;
-  timer: NodeJS.Timeout | null;
-}
-
-interface CandidateBinding {
-  binding: ImportBinding;
-  targetFilePath: string | null;
-  targetSymbolId: string | null;
-  confidence: Confidence;
-  reason: string;
-}
-
-interface DirtyWorkspaceResult {
-  changedAbsolutePaths: string[];
-  removedFilePaths: string[];
-}
+import { Indexer } from "./indexer.js";
+import { Resolver } from "./resolver.js";
+import {
+  ensureDir,
+  findGitRoot,
+  getPaths,
+  readGitRevision,
+  relativeWorkspacePath,
+  stableWorkspaceId,
+} from "./utils.js";
 
 interface IndexWorkspaceOptions {
   path: string;
@@ -116,10 +77,6 @@ function symbolSummary(symbol: CodeSymbol): SymbolSummary {
 
 function matchesPathGlob(filePath: string, pathGlob?: string): boolean {
   return pathGlob ? minimatch(filePath, pathGlob, { dot: true }) : true;
-}
-
-function confidenceRank(confidence: Confidence): number {
-  return confidence === "high" ? 3 : confidence === "medium" ? 2 : 1;
 }
 
 function scoreSymbol(symbol: CodeSymbol, query: string): number {
@@ -176,7 +133,8 @@ export class CodeIntelService {
   readonly store: Store;
   readonly dbPath: string;
   readonly enableWatch: boolean;
-  private readonly watchStates = new Map<string, WorkspaceWatchState>();
+  private readonly indexer: Indexer;
+  private readonly resolver: Resolver;
   private _closed = false;
 
   constructor(options?: { dbPath?: string; enableWatch?: boolean }) {
@@ -186,6 +144,13 @@ export class CodeIntelService {
     this.dbPath = options?.dbPath ?? path.join(paths.cache, "codeintel.sqlite");
     this.enableWatch = options?.enableWatch ?? true;
     this.store = new Store(this.dbPath);
+    this.resolver = new Resolver(this.store);
+    this.indexer = new Indexer(
+      this.store,
+      this.enableWatch,
+      this.resolver,
+      (workspaceId) => this.requireWorkspace(workspaceId),
+    );
   }
 
   async close(): Promise<void> {
@@ -193,13 +158,7 @@ export class CodeIntelService {
       return;
     }
     this._closed = true;
-    for (const watchState of this.watchStates.values()) {
-      if (watchState.timer) {
-        clearTimeout(watchState.timer);
-      }
-      await watchState.watcher.close();
-    }
-    this.watchStates.clear();
+    await this.indexer.close();
     this.store.close();
   }
 
@@ -214,7 +173,7 @@ export class CodeIntelService {
       extraExcludeGlobs: input.extraExcludeGlobs ?? [],
     };
 
-    await this.performFullIndex(config);
+    await this.indexer.performFullIndex(config);
     const record = this.requireWorkspace(workspaceId);
     return {
       workspace: workspaceSummary(record),
@@ -225,9 +184,9 @@ export class CodeIntelService {
   async refreshWorkspace(workspaceId: string, full = false) {
     const workspace = this.requireWorkspace(workspaceId);
     if (full) {
-      await this.performFullIndex(workspace);
+      await this.indexer.performFullIndex(workspace);
     } else {
-      await this.performIncrementalRefresh(workspace);
+      await this.indexer.performIncrementalRefresh(workspace);
     }
     const record = this.requireWorkspace(workspaceId);
     return {
@@ -245,7 +204,7 @@ export class CodeIntelService {
 
   getWorkspaceStatus(workspaceId: string) {
     const workspace = this.requireWorkspace(workspaceId);
-    const dirty = this.detectDirtyWorkspace(workspace);
+    const dirty = this.indexer.detectDirtyWorkspace(workspace);
     const currentRevision = readGitRevision(workspace.rootPath);
     return {
       workspace: workspaceSummary(workspace),
@@ -622,627 +581,6 @@ export class CodeIntelService {
       watch_status: workspace?.watchStatus,
       ...extra,
     };
-  }
-
-  private async performFullIndex(config: WorkspaceConfig): Promise<void> {
-    const startedAt = new Date().toISOString();
-    const revision = readGitRevision(config.rootPath);
-    this.store.upsertWorkspace(config, startedAt, revision);
-    this.store.setWorkspaceWatchState(config.workspaceId, "indexing", null);
-    this.store.clearWorkspaceIndex(config.workspaceId);
-
-    try {
-      for (const absolutePath of this.collectWorkspaceFiles(config)) {
-        this.indexAbsoluteFile(config, absolutePath);
-      }
-      this.rebuildRelations(config);
-      this.store.updateWorkspaceCounts(config.workspaceId);
-      this.store.setWorkspaceRevision(config.workspaceId, startedAt, revision);
-      this.store.setWorkspaceWatchState(config.workspaceId, this.enableWatch ? "watching" : "indexed", null);
-      if (this.enableWatch) {
-        this.ensureWatcher(config);
-      }
-    } catch (error) {
-      this.store.setWorkspaceWatchState(
-        config.workspaceId,
-        "error",
-        error instanceof Error ? error.message : String(error),
-      );
-      throw error;
-    }
-  }
-
-  private async performIncrementalRefresh(workspace: WorkspaceConfig): Promise<void> {
-    this.store.setWorkspaceWatchState(workspace.workspaceId, "indexing", null);
-    const dirty = this.detectDirtyWorkspace(workspace);
-
-    try {
-      const changedRelPaths = dirty.changedAbsolutePaths.map(
-        (absPath) => relativeWorkspacePath(workspace.rootPath, absPath),
-      );
-      for (const absolutePath of dirty.changedAbsolutePaths) {
-        this.indexAbsoluteFile(workspace, absolutePath);
-      }
-      for (const filePath of dirty.removedFilePaths) {
-        this.store.removeFile(workspace.workspaceId, filePath);
-      }
-      const allChangedPaths = [...changedRelPaths, ...dirty.removedFilePaths];
-      this.rebuildRelationsForFiles(workspace, allChangedPaths);
-      this.store.updateWorkspaceCounts(workspace.workspaceId);
-      this.store.setWorkspaceRevision(workspace.workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
-      this.store.setWorkspaceWatchState(workspace.workspaceId, this.enableWatch ? "watching" : "indexed", null);
-    } catch (error) {
-      this.store.setWorkspaceWatchState(
-        workspace.workspaceId,
-        "error",
-        error instanceof Error ? error.message : String(error),
-      );
-      throw error;
-    }
-  }
-
-  private collectWorkspaceFiles(config: WorkspaceConfig): string[] {
-    const ignoreMatcher = ignore();
-    if (config.followGitignore) {
-      const gitignorePath = path.join(config.rootPath, ".gitignore");
-      if (fs.existsSync(gitignorePath)) {
-        ignoreMatcher.add(fs.readFileSync(gitignorePath, "utf8"));
-      }
-    }
-
-    return fg
-      .sync("**/*", {
-        cwd: config.rootPath,
-        absolute: true,
-        onlyFiles: true,
-        dot: true,
-        followSymbolicLinks: false,
-        ignore: [...DEFAULT_EXCLUDE_GLOBS, ...config.extraExcludeGlobs],
-      })
-      .filter((absolutePath) => {
-        const relativePath = relativeWorkspacePath(config.rootPath, absolutePath);
-        if (config.followGitignore && ignoreMatcher.ignores(relativePath)) {
-          return false;
-        }
-        if (!languageFromFilePath(relativePath) || isSecretLikePath(relativePath)) {
-          return false;
-        }
-        const stat = fs.statSync(absolutePath);
-        return stat.isFile() && stat.size <= MAX_FILE_BYTES;
-      })
-      .sort((left, right) => left.localeCompare(right));
-  }
-
-  private detectDirtyWorkspace(workspace: WorkspaceConfig): DirtyWorkspaceResult {
-    const currentFiles = this.collectWorkspaceFiles(workspace);
-    const currentByPath = new Map(
-      currentFiles.map((absolutePath) => {
-        const stat = fs.statSync(absolutePath);
-        return [
-          relativeWorkspacePath(workspace.rootPath, absolutePath),
-          { absolutePath, size: stat.size, mtimeMs: stat.mtimeMs },
-        ];
-      }),
-    );
-
-    const storedFiles = this.store.getFileMeta(workspace.workspaceId);
-    const changedAbsolutePaths: string[] = [];
-    const removedFilePaths: string[] = [];
-
-    for (const storedFile of storedFiles) {
-      const current = currentByPath.get(storedFile.filePath);
-      if (!current) {
-        removedFilePaths.push(storedFile.filePath);
-        continue;
-      }
-      if (current.size !== storedFile.size || Math.floor(current.mtimeMs) !== Math.floor(storedFile.mtimeMs)) {
-        changedAbsolutePaths.push(current.absolutePath);
-      }
-      currentByPath.delete(storedFile.filePath);
-    }
-
-    for (const remaining of currentByPath.values()) {
-      changedAbsolutePaths.push(remaining.absolutePath);
-    }
-
-    return { changedAbsolutePaths, removedFilePaths };
-  }
-
-  private indexAbsoluteFile(config: WorkspaceConfig, absolutePath: string): void {
-    const relativePath = relativeWorkspacePath(config.rootPath, absolutePath);
-    const language = languageFromFilePath(relativePath);
-    if (!language || isSecretLikePath(relativePath)) {
-      return;
-    }
-
-    const stats = fs.statSync(absolutePath);
-    if (!stats.isFile() || stats.size > MAX_FILE_BYTES) {
-      return;
-    }
-
-    const text = fs.readFileSync(absolutePath, "utf8");
-    if (isBinaryContent(text)) {
-      return;
-    }
-
-    const parsed = parseFile(config.workspaceId, relativePath, text, language);
-    const indexedFile: IndexedFile = {
-      workspaceId: config.workspaceId,
-      filePath: relativePath,
-      absolutePath,
-      language,
-      text,
-      size: stats.size,
-      mtimeMs: stats.mtimeMs,
-      hash: hashText(text),
-      imports: parsed.imports,
-      references: parsed.references,
-      calls: parsed.calls,
-      parseError: parsed.parseError,
-    };
-
-    this.store.saveIndexedFile(indexedFile, parsed.symbols);
-  }
-
-  private buildLookupMaps(files: IndexedFile[], symbols: CodeSymbol[]) {
-    const filesByPath = new Map(files.map((file) => [file.filePath, file] as const));
-    const knownFiles = new Set(files.map((file) => file.filePath));
-    const symbolsById = new Map(symbols.map((symbol) => [symbol.id, symbol] as const));
-    const symbolsByName = new Map<string, CodeSymbol[]>();
-    const symbolsByFileAndName = new Map<string, Map<string, CodeSymbol[]>>();
-    const methodsByClassId = new Map<string, Map<string, CodeSymbol[]>>();
-
-    for (const symbol of symbols) {
-      const byName = symbolsByName.get(symbol.name) ?? [];
-      byName.push(symbol);
-      symbolsByName.set(symbol.name, byName);
-
-      const fileMap = symbolsByFileAndName.get(symbol.filePath) ?? new Map<string, CodeSymbol[]>();
-      const fileSymbols = fileMap.get(symbol.name) ?? [];
-      fileSymbols.push(symbol);
-      fileMap.set(symbol.name, fileSymbols);
-      symbolsByFileAndName.set(symbol.filePath, fileMap);
-
-      if (symbol.parentSymbolId) {
-        const classMap = methodsByClassId.get(symbol.parentSymbolId) ?? new Map<string, CodeSymbol[]>();
-        const entries = classMap.get(symbol.name) ?? [];
-        entries.push(symbol);
-        classMap.set(symbol.name, entries);
-        methodsByClassId.set(symbol.parentSymbolId, classMap);
-      }
-    }
-
-    return { filesByPath, knownFiles, symbolsById, symbolsByName, symbolsByFileAndName, methodsByClassId };
-  }
-
-  private resolveFileRelations(
-    workspace: WorkspaceConfig,
-    file: IndexedFile,
-    maps: ReturnType<CodeIntelService["buildLookupMaps"]>,
-    referenceDedup: Set<string>,
-    callDedup: Set<string>,
-  ): { references: ResolvedReference[]; calls: ResolvedCall[] } {
-    const references: ResolvedReference[] = [];
-    const calls: ResolvedCall[] = [];
-
-    const bindings = this.resolveBindings(workspace, file, maps.knownFiles, maps.filesByPath, maps.symbolsByFileAndName);
-    for (const binding of bindings.values()) {
-      if (!binding.targetSymbolId) {
-        continue;
-      }
-      const key = `${file.filePath}:${binding.binding.line}:${binding.binding.column}:${binding.targetSymbolId}:import`;
-      if (referenceDedup.has(key)) {
-        continue;
-      }
-      referenceDedup.add(key);
-      references.push({
-        workspaceId: workspace.workspaceId,
-        filePath: file.filePath,
-        targetSymbolId: binding.targetSymbolId,
-        referencedName: binding.binding.importedName,
-        qualifier: null,
-        enclosingSymbolId: null,
-        line: binding.binding.line,
-        column: binding.binding.column,
-        context: binding.binding.context,
-        confidence: binding.confidence,
-        reason: binding.reason,
-        role: "import",
-      });
-    }
-
-    for (const reference of file.references) {
-      const resolved = this.resolveReference(
-        workspace.workspaceId,
-        file.filePath,
-        reference,
-        bindings,
-        maps.symbolsById,
-        maps.symbolsByName,
-        maps.symbolsByFileAndName,
-        maps.methodsByClassId,
-      );
-      if (!resolved.targetSymbolId) {
-        continue;
-      }
-      const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.targetSymbolId}:${resolved.role}`;
-      if (referenceDedup.has(key)) {
-        continue;
-      }
-      referenceDedup.add(key);
-      references.push(resolved);
-    }
-
-    for (const call of file.calls) {
-      const resolved = this.resolveCall(
-        workspace.workspaceId,
-        file.filePath,
-        call,
-        bindings,
-        maps.symbolsById,
-        maps.symbolsByName,
-        maps.symbolsByFileAndName,
-        maps.methodsByClassId,
-      );
-      const key = `${resolved.filePath}:${resolved.line}:${resolved.column}:${resolved.callerSymbolId}:${resolved.calleeSymbolId ?? resolved.calleeName}`;
-      if (callDedup.has(key)) {
-        continue;
-      }
-      callDedup.add(key);
-      calls.push(resolved);
-    }
-
-    return { references, calls };
-  }
-
-  private rebuildRelations(workspace: WorkspaceConfig): void {
-    const files = this.store.getFiles(workspace.workspaceId);
-    const symbols = this.store.getSymbols(workspace.workspaceId);
-    const maps = this.buildLookupMaps(files, symbols);
-
-    const references: ResolvedReference[] = [];
-    const calls: ResolvedCall[] = [];
-    const referenceDedup = new Set<string>();
-    const callDedup = new Set<string>();
-
-    for (const file of files) {
-      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
-      references.push(...result.references);
-      calls.push(...result.calls);
-    }
-
-    this.store.replaceResolvedRelations(workspace.workspaceId, references, calls);
-  }
-
-  private rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[]): void {
-    if (changedFilePaths.length === 0) return;
-
-    const dependentPaths = this.store.getFilesThatImportFrom(workspace.workspaceId, changedFilePaths);
-    const allAffectedPaths = [...new Set([...changedFilePaths, ...dependentPaths])];
-
-    this.store.deleteRelationsForFiles(workspace.workspaceId, allAffectedPaths);
-
-    const allFiles = this.store.getFiles(workspace.workspaceId);
-    const allSymbols = this.store.getSymbols(workspace.workspaceId);
-    const maps = this.buildLookupMaps(allFiles, allSymbols);
-
-    const affectedSet = new Set(allAffectedPaths);
-    const affectedFiles = allFiles.filter((f) => affectedSet.has(f.filePath));
-
-    const references: ResolvedReference[] = [];
-    const calls: ResolvedCall[] = [];
-    const referenceDedup = new Set<string>();
-    const callDedup = new Set<string>();
-
-    for (const file of affectedFiles) {
-      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
-      references.push(...result.references);
-      calls.push(...result.calls);
-    }
-
-    this.store.insertResolvedRelations(references, calls);
-  }
-
-  private resolveBindings(
-    workspace: WorkspaceConfig,
-    file: IndexedFile,
-    knownFiles: Set<string>,
-    filesByPath: Map<string, IndexedFile>,
-    symbolsByFileAndName: Map<string, Map<string, CodeSymbol[]>>,
-  ): Map<string, CandidateBinding> {
-    const bindings = new Map<string, CandidateBinding>();
-
-    for (const binding of file.imports) {
-      const targetFilePath =
-        file.language === "python"
-          ? resolvePythonModule(file.filePath, binding.moduleSpecifier, knownFiles)
-          : resolveJsImport(workspace.rootPath, file.filePath, binding.moduleSpecifier, knownFiles);
-
-      let targetSymbolId: string | null = null;
-      let confidence: Confidence = "low";
-      let reason = targetFilePath ? "Resolved import target file." : "Could not resolve import target file.";
-
-      if (targetFilePath) {
-        const targetSymbols = symbolsByFileAndName.get(targetFilePath);
-        if (binding.kind !== "namespace" && targetSymbols) {
-          const matches =
-            binding.importedName === "default"
-              ? Array.from(targetSymbols.values())
-                  .flat()
-                  .filter((symbol) => ["function", "class"].includes(symbol.kind))
-              : targetSymbols.get(binding.importedName) ?? [];
-          if (matches.length === 1) {
-            targetSymbolId = matches[0].id;
-            confidence = binding.importedName === "default" ? "medium" : "high";
-            reason =
-              binding.importedName === "default"
-                ? "Resolved default import to the file's primary exported symbol."
-                : "Resolved named import to a unique symbol in the target file.";
-          } else if (matches.length > 1) {
-            targetSymbolId = matches[0].id;
-            confidence = "low";
-            reason = "Multiple target symbols matched this import; using the first indexed symbol.";
-          }
-        }
-      }
-
-      bindings.set(binding.localName, {
-        binding,
-        targetFilePath,
-        targetSymbolId,
-        confidence,
-        reason,
-      });
-    }
-
-    return bindings;
-  }
-
-  private resolveReference(
-    workspaceId: string,
-    filePath: string,
-    reference: RawReference,
-    bindings: Map<string, CandidateBinding>,
-    symbolsById: Map<string, CodeSymbol>,
-    symbolsByName: Map<string, CodeSymbol[]>,
-    symbolsByFileAndName: Map<string, Map<string, CodeSymbol[]>>,
-    methodsByClassId: Map<string, Map<string, CodeSymbol[]>>,
-  ): ResolvedReference {
-    let resolvedSymbol: CodeSymbol | null = null;
-    let confidence: Confidence = "low";
-    let reason = "No resolution heuristic matched.";
-
-    if ((reference.qualifier === "this" || reference.qualifier === "self" || reference.qualifier === "cls") && reference.enclosingSymbolId) {
-      const enclosing = symbolsById.get(reference.enclosingSymbolId);
-      if (enclosing?.parentSymbolId) {
-        const classMethods = methodsByClassId.get(enclosing.parentSymbolId)?.get(reference.name) ?? [];
-        if (classMethods.length === 1) {
-          resolvedSymbol = classMethods[0];
-          confidence = "high";
-          reason = "Resolved through current class method lookup.";
-        }
-      }
-    }
-
-    if (!resolvedSymbol && reference.qualifier && bindings.has(reference.qualifier)) {
-      const binding = bindings.get(reference.qualifier)!;
-      if (binding.binding.kind === "namespace" && binding.targetFilePath) {
-        const namespaceSymbols = symbolsByFileAndName.get(binding.targetFilePath)?.get(reference.name) ?? [];
-        if (namespaceSymbols.length === 1) {
-          resolvedSymbol = namespaceSymbols[0];
-          confidence = "high";
-          reason = "Resolved through namespace import and member access.";
-        }
-      }
-    }
-
-    if (!resolvedSymbol && bindings.has(reference.name)) {
-      const binding = bindings.get(reference.name)!;
-      if (binding.targetSymbolId) {
-        resolvedSymbol = symbolsById.get(binding.targetSymbolId) ?? null;
-        confidence = binding.confidence;
-        reason = binding.reason;
-      }
-    }
-
-    if (!resolvedSymbol) {
-      const localMatches = symbolsByFileAndName.get(filePath)?.get(reference.name) ?? [];
-      if (localMatches.length === 1) {
-        resolvedSymbol = localMatches[0];
-        confidence = "high";
-        reason = "Resolved to a unique symbol in the same file.";
-      }
-    }
-
-    if (!resolvedSymbol) {
-      const workspaceMatches = symbolsByName.get(reference.name) ?? [];
-      if (workspaceMatches.length === 1) {
-        resolvedSymbol = workspaceMatches[0];
-        confidence = "medium";
-        reason = "Resolved to a unique symbol name across the workspace.";
-      }
-    }
-
-    return {
-      workspaceId,
-      filePath,
-      targetSymbolId: resolvedSymbol?.id ?? null,
-      referencedName: reference.name,
-      qualifier: reference.qualifier,
-      enclosingSymbolId: reference.enclosingSymbolId,
-      line: reference.line,
-      column: reference.column,
-      context: reference.context,
-      confidence,
-      reason,
-      role: reference.role,
-    };
-  }
-
-  private resolveCall(
-    workspaceId: string,
-    filePath: string,
-    call: RawCall,
-    bindings: Map<string, CandidateBinding>,
-    symbolsById: Map<string, CodeSymbol>,
-    symbolsByName: Map<string, CodeSymbol[]>,
-    symbolsByFileAndName: Map<string, Map<string, CodeSymbol[]>>,
-    methodsByClassId: Map<string, Map<string, CodeSymbol[]>>,
-  ): ResolvedCall {
-    const resolved = this.resolveReference(
-      workspaceId,
-      filePath,
-      {
-        name: call.calleeName,
-        qualifier: call.qualifier,
-        role: "call",
-        line: call.line,
-        column: call.column,
-        context: call.context,
-        enclosingSymbolId: call.callerSymbolId,
-      },
-      bindings,
-      symbolsById,
-      symbolsByName,
-      symbolsByFileAndName,
-      methodsByClassId,
-    );
-
-    return {
-      workspaceId: resolved.workspaceId,
-      filePath,
-      callerSymbolId: call.callerSymbolId,
-      calleeSymbolId: resolved.targetSymbolId,
-      calleeName: call.calleeName,
-      qualifier: call.qualifier,
-      line: call.line,
-      column: call.column,
-      context: call.context,
-      confidence: resolved.confidence,
-      reason: resolved.reason,
-    };
-  }
-
-  private ensureWatcher(workspace: WorkspaceConfig): void {
-    if (this.watchStates.has(workspace.workspaceId)) {
-      return;
-    }
-
-    const watcher = chokidar.watch(workspace.rootPath, {
-      ignoreInitial: true,
-      awaitWriteFinish: {
-        stabilityThreshold: 250,
-        pollInterval: 50,
-      },
-      ignored: (watchedPath) => {
-        const relativePath = relativeWorkspacePath(workspace.rootPath, watchedPath);
-        if (!relativePath || relativePath.startsWith("..")) {
-          return false;
-        }
-        if (DEFAULT_EXCLUDE_GLOBS.some((pattern) => minimatch(relativePath, pattern, { dot: true }))) {
-          return true;
-        }
-        if (workspace.extraExcludeGlobs.some((pattern) => minimatch(relativePath, pattern, { dot: true }))) {
-          return true;
-        }
-        return isSecretLikePath(relativePath);
-      },
-    });
-
-    const state: WorkspaceWatchState = {
-      watcher,
-      queuedChanges: new Map(),
-      fullRefreshQueued: false,
-      timer: null,
-    };
-
-    const schedule = () => {
-      if (state.timer) {
-        clearTimeout(state.timer);
-      }
-      state.timer = setTimeout(() => {
-        state.timer = null;
-        void this.flushWatchQueue(workspace.workspaceId);
-      }, 300);
-    };
-
-    watcher.on("add", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "change");
-      schedule();
-    });
-    watcher.on("change", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "change");
-      schedule();
-    });
-    watcher.on("unlink", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "unlink");
-      schedule();
-    });
-    watcher.on("error", (error) => {
-      state.fullRefreshQueued = true;
-      this.store.setWorkspaceWatchState(
-        workspace.workspaceId,
-        "error",
-        error instanceof Error ? error.message : String(error),
-      );
-      schedule();
-    });
-
-    this.watchStates.set(workspace.workspaceId, state);
-  }
-
-  private async flushWatchQueue(workspaceId: string): Promise<void> {
-    const workspace = this.requireWorkspace(workspaceId);
-    const state = this.watchStates.get(workspaceId);
-    if (!state) {
-      return;
-    }
-
-    if (state.fullRefreshQueued) {
-      state.fullRefreshQueued = false;
-      state.queuedChanges.clear();
-      await this.performFullIndex(workspace);
-      return;
-    }
-
-    if (state.queuedChanges.size === 0) {
-      return;
-    }
-
-    const queued = Array.from(state.queuedChanges.entries());
-    state.queuedChanges.clear();
-    this.store.setWorkspaceWatchState(workspaceId, "indexing", null);
-
-    try {
-      const changedPaths: string[] = [];
-      for (const [absolutePath, operation] of queued) {
-        const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
-        if (relativePath === ".git/HEAD") {
-          await this.performFullIndex(workspace);
-          return;
-        }
-        if (operation === "unlink") {
-          changedPaths.push(relativePath);
-          this.store.removeFile(workspaceId, relativePath);
-          continue;
-        }
-        if (!fs.existsSync(absolutePath)) {
-          continue;
-        }
-        changedPaths.push(relativePath);
-        this.indexAbsoluteFile(workspace, absolutePath);
-      }
-      this.rebuildRelationsForFiles(workspace, changedPaths);
-      this.store.updateWorkspaceCounts(workspaceId);
-      this.store.setWorkspaceRevision(workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
-      this.store.setWorkspaceWatchState(workspaceId, "watching", null);
-    } catch (error) {
-      this.store.setWorkspaceWatchState(
-        workspaceId,
-        "error",
-        error instanceof Error ? error.message : String(error),
-      );
-    }
   }
 
   private requireWorkspace(workspaceId: string): WorkspaceRecord {
