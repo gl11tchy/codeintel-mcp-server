@@ -32,6 +32,8 @@ export const SECRET_PATTERNS = [
 const LANGUAGE_BY_EXTENSION: Record<string, SupportedLanguage> = {
   ".js": "javascript",
   ".jsx": "javascript",
+  ".mjs": "javascript",
+  ".cjs": "javascript",
   ".ts": "typescript",
   ".tsx": "tsx",
   ".py": "python",
@@ -105,19 +107,47 @@ export function truncate(value: string, maxLength = 200): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
-export function safeJsonParse<T>(value: string | null): T {
+export function safeJsonParse<T>(value: string | null, fallback: T): T {
   if (!value) {
-    return [] as T;
+    return fallback;
   }
-  return JSON.parse(value) as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export function splitIdentifier(name: string): string {
+  // Split camelCase: getUserById -> get User By Id
+  const camelSplit = name.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2");
+  // Split snake_case: get_user_by_id -> get user by id
+  const snakeSplit = camelSplit.replace(/_/g, " ");
+  // Combine original + splits, deduplicated
+  const tokens = new Set(
+    [name, ...snakeSplit.split(/\s+/)]
+      .map((t) => t.toLowerCase())
+      .filter(Boolean),
+  );
+  return Array.from(tokens).join(" ");
 }
 
 export function sanitizeFtsQuery(query: string): string {
-  return query
+  const rawTokens = query
     .trim()
     .split(/\s+/)
     .map((token) => token.replace(/["']/g, ""))
-    .filter(Boolean)
+    .filter(Boolean);
+
+  // Also split each token by camelCase/snake_case boundaries
+  const allTokens = new Set<string>();
+  for (const token of rawTokens) {
+    for (const part of splitIdentifier(token).split(/\s+/)) {
+      if (part) allTokens.add(part);
+    }
+  }
+
+  return Array.from(allTokens)
     .map((token) => `"${token}"`)
     .join(" ");
 }

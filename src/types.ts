@@ -5,7 +5,8 @@ export type SymbolKind =
   | "class"
   | "method"
   | "type"
-  | "constant";
+  | "constant"
+  | "property";
 
 export type ResponseFormat = "markdown" | "json";
 
@@ -28,6 +29,16 @@ export interface WorkspaceRecord extends WorkspaceConfig {
   symbolCount: number;
   watchStatus: string;
   watchError: string | null;
+}
+
+export interface FileMeta {
+  workspaceId: string;
+  filePath: string;
+  absolutePath: string;
+  language: SupportedLanguage;
+  size: number;
+  mtimeMs: number;
+  hash: string;
 }
 
 export interface IndexedFile {

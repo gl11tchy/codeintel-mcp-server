@@ -1,9 +1,25 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
 import { estimateTokens } from "../core/utils.js";
 import { CodeIntelService } from "../core/service.js";
 import type { FileTreeNode, MetaEnvelope, OutlineNode, ResponseFormat } from "../types.js";
+import {
+  indexWorkspaceOutputSchema,
+  listWorkspacesOutputSchema,
+  getWorkspaceStatusOutputSchema,
+  refreshWorkspaceOutputSchema,
+  getFileTreeOutputSchema,
+  getFileOutlineOutputSchema,
+  searchSymbolsOutputSchema,
+  getSymbolOutputSchema,
+  searchTextOutputSchema,
+  findReferencesOutputSchema,
+  findCallersOutputSchema,
+  findCalleesOutputSchema,
+  renameSymbolOutputSchema,
+  moveSymbolOutputSchema,
+} from "./schemas.js";
 
 const responseFormatSchema = z
   .enum(["markdown", "json"])
@@ -77,7 +93,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       name: "codeintel-mcp-server",
       version: "0.1.0",
     },
-    { capabilities: { logging: {} } },
+    { capabilities: { logging: {}, resources: {} } },
   );
 
   server.registerTool(
@@ -91,6 +107,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         follow_gitignore: z.boolean().default(true).describe("Whether to respect the root .gitignore file during indexing."),
         response_format: responseFormatSchema,
       },
+      outputSchema: indexWorkspaceOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -122,6 +139,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       inputSchema: {
         response_format: responseFormatSchema,
       },
+      outputSchema: listWorkspacesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -155,6 +173,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         workspace_id: workspaceIdSchema,
         response_format: responseFormatSchema.default("json"),
       },
+      outputSchema: getWorkspaceStatusOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -190,6 +209,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         full: z.boolean().default(false).describe("Set true to rebuild the workspace index from scratch."),
         response_format: responseFormatSchema,
       },
+      outputSchema: refreshWorkspaceOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -221,6 +241,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(1000).default(200).describe("Maximum number of indexed files to include."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getFileTreeOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -250,6 +271,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         file_path: z.string().min(1).describe("Relative path to a file within the indexed workspace."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getFileOutlineOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -284,6 +306,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: searchSymbolsOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -331,6 +354,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         include_body: z.boolean().default(true).describe("Whether to include the exact symbol body."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getSymbolOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -374,6 +398,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: searchTextOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -417,6 +442,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: findReferencesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -456,6 +482,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(100).default(25).describe("Maximum number of caller edges to return."),
         response_format: responseFormatSchema,
       },
+      outputSchema: findCallersOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -492,6 +519,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(100).default(25).describe("Maximum number of callee edges to return."),
         response_format: responseFormatSchema,
       },
+      outputSchema: findCalleesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -513,6 +541,265 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
               )
               .join("\n");
       return makeResult(response_format, { ...result, _meta: meta }, markdown);
+    },
+  );
+
+  server.registerTool(
+    "codeintel_rename_symbol",
+    {
+      title: "Rename Symbol",
+      description:
+        "Rename a symbol and update all resolved references across the workspace. Defaults to dry-run mode.",
+      inputSchema: {
+        workspace_id: workspaceIdSchema,
+        symbol_id: z.string().min(3).describe("Stable symbol id to rename."),
+        new_name: z.string().min(1).describe("New name for the symbol."),
+        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+        response_format: responseFormatSchema,
+      },
+      outputSchema: renameSymbolOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspace_id, symbol_id, new_name, dry_run, response_format }) => {
+      const startedAt = performance.now();
+      const result = service.renameSymbol(workspace_id, symbol_id, new_name, dry_run);
+      const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+      const markdown = [
+        `${dry_run ? "Preview" : "Applied"} rename: \`${result.edits[0]?.oldText}\` → \`${new_name}\``,
+        "",
+        `- Files affected: ${result.filesAffected}`,
+        `- References updated: ${result.referencesUpdated}`,
+        result.warnings.length > 0
+          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+          : "",
+        "",
+        "Changes:",
+        ...result.edits.map(
+          (e) => `- ${e.filePath}:${e.line}:${e.column} \`${e.oldText}\` → \`${e.newText}\``,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return makeResult(response_format, { ...result, _meta: meta }, markdown);
+    },
+  );
+
+  server.registerTool(
+    "codeintel_move_symbol",
+    {
+      title: "Move Symbol",
+      description:
+        "Move a symbol to a different file and update import paths. Defaults to dry-run mode.",
+      inputSchema: {
+        workspace_id: workspaceIdSchema,
+        symbol_id: z.string().min(3).describe("Symbol id to move."),
+        target_file_path: z.string().min(1).describe("Relative path within the workspace for the symbol's new location."),
+        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+        response_format: responseFormatSchema,
+      },
+      outputSchema: moveSymbolOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspace_id, symbol_id, target_file_path, dry_run, response_format }) => {
+      const startedAt = performance.now();
+      const result = service.moveSymbol(workspace_id, symbol_id, target_file_path, dry_run);
+      const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+      const markdown = [
+        `${dry_run ? "Preview" : "Applied"} move to \`${target_file_path}\``,
+        "",
+        `- Files affected: ${result.filesAffected}`,
+        result.warnings.length > 0
+          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+          : "",
+        "",
+        "Edits:",
+        ...result.edits.map(
+          (e) => `- [${e.action}] ${e.filePath}:${e.line}${e.endLine ? `-${e.endLine}` : ""}`,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return makeResult(response_format, { ...result, _meta: meta }, markdown);
+    },
+  );
+
+  // ---------------------------------------------------------------------------
+  // Resources
+  // ---------------------------------------------------------------------------
+
+  // Static resource: list all indexed workspaces
+  server.registerResource(
+    "workspaces",
+    "codeintel://workspaces",
+    {
+      description: "List all indexed workspaces with summary metadata and language counts.",
+      mimeType: "application/json",
+    },
+    async (uri) => ({
+      contents: [
+        {
+          uri: uri.href,
+          mimeType: "application/json",
+          text: JSON.stringify(service.listWorkspaces(), null, 2),
+        },
+      ],
+    }),
+  );
+
+  // Resource template: workspace detail
+  server.registerResource(
+    "workspace_detail",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}", {
+      list: async () => ({
+        resources: service.listWorkspaces().map((ws) => ({
+          uri: `codeintel://workspace/${ws.workspace_id}`,
+          name: ws.display_name,
+          description: `Workspace ${ws.display_name} (${ws.file_count} files, ${ws.symbol_count} symbols)`,
+          mimeType: "application/json",
+        })),
+      }),
+    }),
+    {
+      description: "Workspace summary including language counts.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const status = service.getWorkspaceStatus(workspaceId);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(status, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: file listing for a workspace
+  server.registerResource(
+    "workspace_files",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/files", {
+      list: async () => ({
+        resources: service.listWorkspaces().map((ws) => ({
+          uri: `codeintel://workspace/${ws.workspace_id}/files`,
+          name: `${ws.display_name} files`,
+          description: `File listing for workspace ${ws.display_name}`,
+          mimeType: "application/json",
+        })),
+      }),
+    }),
+    {
+      description: "JSON array of indexed file paths with language and symbol count.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const files = service.store.getFileMeta(workspaceId);
+      const symbols = service.store.getSymbols(workspaceId);
+      const symbolCountByFile = new Map<string, number>();
+      for (const symbol of symbols) {
+        symbolCountByFile.set(symbol.filePath, (symbolCountByFile.get(symbol.filePath) ?? 0) + 1);
+      }
+      const items = files.map((file) => ({
+        file_path: file.filePath,
+        language: file.language,
+        size: file.size,
+        symbol_count: symbolCountByFile.get(file.filePath) ?? 0,
+      }));
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(items, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: file content + outline
+  // Uses {+filePath} (RFC 6570 reserved expansion) so slashes in file paths are matched.
+  server.registerResource(
+    "file_content",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/file/{+filePath}", {
+      list: undefined,
+    }),
+    {
+      description: "File source content and symbol outline for a single indexed file.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const filePath = variables.filePath as string;
+      const file = service.store.getFile(workspaceId, filePath);
+      if (!file) {
+        throw new Error(`File not found: ${filePath} in workspace ${workspaceId}`);
+      }
+      const outline = service.getFileOutline(workspaceId, filePath);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(
+              {
+                file_path: file.filePath,
+                language: file.language,
+                size: file.size,
+                content: file.text,
+                outline,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: symbol detail
+  // Uses {+symbolId} because symbol IDs contain path separators and special characters (e.g. path::name#kind).
+  server.registerResource(
+    "symbol_detail",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/symbol/{+symbolId}", {
+      list: undefined,
+    }),
+    {
+      description: "Symbol body and metadata for a single indexed symbol.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const symbolId = variables.symbolId as string;
+      const result = service.getSymbol(workspaceId, symbolId);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
     },
   );
 

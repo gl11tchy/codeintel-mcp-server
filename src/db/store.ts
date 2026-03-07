@@ -2,15 +2,17 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
-import { ensureDir, safeJsonParse, sanitizeFtsQuery } from "../core/utils.js";
+import { ensureDir, safeJsonParse, sanitizeFtsQuery, splitIdentifier } from "../core/utils.js";
 import type {
   CodeSymbol,
+  FileMeta,
   ImportBinding,
   IndexedFile,
   RawCall,
   RawReference,
   ResolvedCall,
   ResolvedReference,
+  SupportedLanguage,
   WorkspaceConfig,
   WorkspaceRecord,
 } from "../types.js";
@@ -443,12 +445,14 @@ export class Store {
 
       for (const symbol of symbols) {
         insertSymbol.run(symbol);
+        const searchName = `${symbol.name} ${splitIdentifier(symbol.name)}`;
+        const searchQualified = `${symbol.qualifiedName} ${splitIdentifier(symbol.qualifiedName)}`;
         insertSymbolFts.run(
           symbol.workspaceId,
           symbol.filePath,
           symbol.id,
-          symbol.name,
-          symbol.qualifiedName,
+          searchName,
+          searchQualified,
           symbol.signature,
           symbol.summary,
         );
@@ -468,6 +472,21 @@ export class Store {
     transaction();
   }
 
+  getFileMeta(workspaceId: string): FileMeta[] {
+    const rows = this.db
+      .prepare("SELECT workspace_id, file_path, absolute_path, language, size, mtime_ms, hash FROM files WHERE workspace_id = ? ORDER BY file_path ASC")
+      .all(workspaceId) as Array<{workspace_id: string; file_path: string; absolute_path: string; language: string; size: number; mtime_ms: number; hash: string}>;
+    return rows.map(row => ({
+      workspaceId: row.workspace_id,
+      filePath: row.file_path,
+      absolutePath: row.absolute_path,
+      language: row.language as SupportedLanguage,
+      size: row.size,
+      mtimeMs: row.mtime_ms,
+      hash: row.hash,
+    }));
+  }
+
   getFiles(workspaceId: string): IndexedFile[] {
     const rows = this.db
       .prepare("SELECT * FROM files WHERE workspace_id = ? ORDER BY file_path ASC")
@@ -482,9 +501,9 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     }));
   }
@@ -532,9 +551,9 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     };
   }
@@ -544,6 +563,80 @@ export class Store {
       this.db.prepare("DELETE FROM references_resolved WHERE workspace_id = ?").run(workspaceId);
       this.db.prepare("DELETE FROM calls_resolved WHERE workspace_id = ?").run(workspaceId);
 
+      const insertReference = this.db.prepare(`
+        INSERT INTO references_resolved (
+          workspace_id,
+          file_path,
+          target_symbol_id,
+          referenced_name,
+          qualifier,
+          enclosing_symbol_id,
+          line,
+          column,
+          context,
+          confidence,
+          reason,
+          role
+        ) VALUES (
+          @workspaceId,
+          @filePath,
+          @targetSymbolId,
+          @referencedName,
+          @qualifier,
+          @enclosingSymbolId,
+          @line,
+          @column,
+          @context,
+          @confidence,
+          @reason,
+          @role
+        )
+      `);
+
+      const insertCall = this.db.prepare(`
+        INSERT INTO calls_resolved (
+          workspace_id,
+          file_path,
+          caller_symbol_id,
+          callee_symbol_id,
+          callee_name,
+          qualifier,
+          line,
+          column,
+          context,
+          confidence,
+          reason
+        ) VALUES (
+          @workspaceId,
+          @filePath,
+          @callerSymbolId,
+          @calleeSymbolId,
+          @calleeName,
+          @qualifier,
+          @line,
+          @column,
+          @context,
+          @confidence,
+          @reason
+        )
+      `);
+
+      for (const reference of references) {
+        insertReference.run(reference);
+      }
+
+      for (const call of calls) {
+        insertCall.run(call);
+      }
+    });
+
+    transaction();
+  }
+
+  insertResolvedRelations(references: ResolvedReference[], calls: ResolvedCall[]): void {
+    if (references.length === 0 && calls.length === 0) return;
+
+    const transaction = this.db.transaction(() => {
       const insertReference = this.db.prepare(`
         INSERT INTO references_resolved (
           workspace_id,
@@ -743,9 +836,9 @@ export class Store {
             size: row.size,
             mtimeMs: row.mtime_ms,
             hash: row.hash,
-            imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-            references: safeJsonParse<RawReference[]>(row.references_json),
-            calls: safeJsonParse<RawCall[]>(row.calls_json),
+            imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+            references: safeJsonParse<RawReference[]>(row.references_json, []),
+            calls: safeJsonParse<RawCall[]>(row.calls_json, []),
             parseError: row.parse_error,
           }));
         }
@@ -773,11 +866,44 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     }));
+  }
+
+  deleteRelationsForFiles(workspaceId: string, filePaths: string[]): void {
+    if (filePaths.length === 0) return;
+
+    const transaction = this.db.transaction(() => {
+      const placeholders = filePaths.map(() => "?").join(",");
+      this.db
+        .prepare(`DELETE FROM references_resolved WHERE workspace_id = ? AND file_path IN (${placeholders})`)
+        .run(workspaceId, ...filePaths);
+      this.db
+        .prepare(`DELETE FROM calls_resolved WHERE workspace_id = ? AND file_path IN (${placeholders})`)
+        .run(workspaceId, ...filePaths);
+    });
+    transaction();
+  }
+
+  getFilesThatImportFrom(workspaceId: string, targetFilePaths: string[]): string[] {
+    if (targetFilePaths.length === 0) return [];
+
+    const targetSet = new Set(targetFilePaths);
+    const likeClauses = targetFilePaths.map(() => "imports_json LIKE ?").join(" OR ");
+    const likeParams = targetFilePaths.map((fp) => `%${fp}%`);
+
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT file_path FROM files WHERE workspace_id = ? AND (${likeClauses})`,
+      )
+      .all(workspaceId, ...likeParams) as Array<{ file_path: string }>;
+
+    return rows
+      .map((row) => row.file_path)
+      .filter((fp) => !targetSet.has(fp));
   }
 
   private mapWorkspace(row: WorkspaceRow): WorkspaceRecord {
@@ -786,7 +912,7 @@ export class Store {
       rootPath: row.root_path,
       displayName: row.display_name,
       followGitignore: row.follow_gitignore === 1,
-      extraExcludeGlobs: safeJsonParse<string[]>(row.extra_exclude_globs_json),
+      extraExcludeGlobs: safeJsonParse<string[]>(row.extra_exclude_globs_json, []),
       indexedAt: row.indexed_at,
       indexedRevision: row.indexed_revision,
       fileCount: row.file_count,
