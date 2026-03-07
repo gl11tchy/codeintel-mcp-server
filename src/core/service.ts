@@ -20,7 +20,7 @@ import type {
   WorkspaceSummary,
 } from "../types.js";
 import { Indexer } from "./indexer.js";
-import { Refactor, type RenameResult } from "./refactor.js";
+import { Refactor, type RenameResult, type MoveResult } from "./refactor.js";
 import { Resolver } from "./resolver.js";
 import {
   ensureDir,
@@ -590,6 +590,25 @@ export class CodeIntelService {
   renameSymbol(workspaceId: string, symbolId: string, newName: string, dryRun = true): RenameResult {
     const workspace = this.requireWorkspace(workspaceId);
     const result = this.refactor.renameSymbol(workspaceId, symbolId, newName, dryRun, workspace.rootPath);
+
+    if (result.applied) {
+      const affectedPaths = [...new Set(result.edits.map((e) => e.filePath))];
+      for (const filePath of affectedPaths) {
+        const absolutePath = path.join(workspace.rootPath, filePath);
+        if (fs.existsSync(absolutePath)) {
+          this.indexer.indexAbsoluteFile(workspace, absolutePath);
+        }
+      }
+      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths);
+      this.store.updateWorkspaceCounts(workspaceId);
+    }
+
+    return result;
+  }
+
+  moveSymbol(workspaceId: string, symbolId: string, targetFilePath: string, dryRun = true): MoveResult {
+    const workspace = this.requireWorkspace(workspaceId);
+    const result = this.refactor.moveSymbol(workspaceId, symbolId, targetFilePath, dryRun, workspace.rootPath);
 
     if (result.applied) {
       const affectedPaths = [...new Set(result.edits.map((e) => e.filePath))];

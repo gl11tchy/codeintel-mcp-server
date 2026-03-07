@@ -19,6 +19,22 @@ export interface RenameResult {
   applied: boolean;
 }
 
+export interface MoveEdit {
+  filePath: string;
+  action: "remove_lines" | "insert_lines" | "replace_import";
+  line: number;
+  endLine?: number;
+  oldText?: string;
+  newText: string;
+}
+
+export interface MoveResult {
+  edits: MoveEdit[];
+  filesAffected: number;
+  warnings: string[];
+  applied: boolean;
+}
+
 export class Refactor {
   constructor(private readonly store: Store) {}
 
@@ -87,6 +103,201 @@ export class Refactor {
       warnings,
       applied: !dryRun,
     };
+  }
+
+  moveSymbol(
+    workspaceId: string,
+    symbolId: string,
+    targetFilePath: string,
+    dryRun: boolean,
+    workspaceRoot: string,
+  ): MoveResult {
+    const symbol = this.store.getSymbol(symbolId);
+    if (!symbol || symbol.workspaceId !== workspaceId) {
+      throw new Error(`Symbol not found: ${symbolId}`);
+    }
+
+    const sourceFilePath = symbol.filePath;
+    if (sourceFilePath === targetFilePath) {
+      throw new Error(`Symbol is already in ${targetFilePath}`);
+    }
+
+    const edits: MoveEdit[] = [];
+    const warnings: string[] = [];
+
+    // Read the source file to extract the symbol text
+    const sourceAbsolutePath = path.join(workspaceRoot, sourceFilePath);
+    if (!fs.existsSync(sourceAbsolutePath)) {
+      throw new Error(`Source file not found: ${sourceAbsolutePath}`);
+    }
+    const sourceContent = fs.readFileSync(sourceAbsolutePath, "utf8");
+    const sourceLines = sourceContent.split("\n");
+    const symbolText = sourceLines.slice(symbol.line - 1, symbol.endLine).join("\n");
+
+    // Check if target file already has a symbol with the same name
+    const targetAbsolutePath = path.join(workspaceRoot, targetFilePath);
+    if (fs.existsSync(targetAbsolutePath)) {
+      const targetContent = fs.readFileSync(targetAbsolutePath, "utf8");
+      // Simple check: look for the symbol name as a declaration
+      const namePattern = new RegExp(`\\b(function|class|const|let|var|type|interface)\\s+${symbol.name}\\b`);
+      if (namePattern.test(targetContent)) {
+        warnings.push(`Target file already contains a symbol named '${symbol.name}'`);
+      }
+    }
+
+    // Edit 1: Remove the symbol from the source file
+    edits.push({
+      filePath: sourceFilePath,
+      action: "remove_lines",
+      line: symbol.line,
+      endLine: symbol.endLine,
+      newText: "",
+    });
+
+    // Edit 2: Append the symbol to the target file
+    edits.push({
+      filePath: targetFilePath,
+      action: "insert_lines",
+      line: -1, // -1 means append
+      newText: symbolText,
+    });
+
+    // Edit 3: Update import paths in files that import this symbol from the source file
+    const references = this.store.getReferencesForSymbol(workspaceId, symbolId);
+    const importRefs = references.filter((ref) => ref.role === "import");
+
+    for (const ref of importRefs) {
+      // Skip references in the source file itself
+      if (ref.filePath === sourceFilePath) continue;
+
+      const importingAbsolutePath = path.join(workspaceRoot, ref.filePath);
+      if (!fs.existsSync(importingAbsolutePath)) continue;
+
+      const importingContent = fs.readFileSync(importingAbsolutePath, "utf8");
+      const importingLines = importingContent.split("\n");
+      const importLine = importingLines[ref.line - 1];
+      if (!importLine) continue;
+
+      // Check if the import line imports other symbols too
+      const importedNames = this.extractImportedNames(importLine);
+      if (importedNames.length > 1) {
+        warnings.push(
+          `${ref.filePath}:${ref.line} imports multiple symbols from '${sourceFilePath}' — only the moved symbol's import was updated. You may need to manually split the import.`,
+        );
+        continue;
+      }
+
+      // Compute the new relative import path from the importing file to the target file
+      const importingDir = path.dirname(ref.filePath);
+      let newRelativePath = path.posix.relative(importingDir, targetFilePath);
+      // Strip extension for TS-style imports
+      newRelativePath = newRelativePath.replace(/\.(ts|tsx|js|jsx)$/, "");
+      if (!newRelativePath.startsWith(".")) {
+        newRelativePath = `./${newRelativePath}`;
+      }
+
+      // Replace the old module specifier in the import line
+      const oldRelativePath = this.extractModuleSpecifier(importLine);
+      if (oldRelativePath) {
+        const newImportLine = importLine.replace(oldRelativePath, newRelativePath);
+        edits.push({
+          filePath: ref.filePath,
+          action: "replace_import",
+          line: ref.line,
+          oldText: importLine,
+          newText: newImportLine,
+        });
+      }
+    }
+
+    const uniqueFiles = new Set(edits.map((e) => e.filePath));
+
+    if (!dryRun) {
+      this.applyMoveEdits(edits, workspaceRoot);
+    }
+
+    return {
+      edits,
+      filesAffected: uniqueFiles.size,
+      warnings,
+      applied: !dryRun,
+    };
+  }
+
+  private extractImportedNames(importLine: string): string[] {
+    // Match `{ name1, name2 }` or `{ name1 as alias, name2 }` patterns
+    const braceMatch = importLine.match(/\{([^}]+)\}/);
+    if (!braceMatch) return [];
+    return braceMatch[1]
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  private extractModuleSpecifier(importLine: string): string | null {
+    // Match `from "..."` or `from '...'`
+    const match = importLine.match(/from\s+["']([^"']+)["']/);
+    return match ? match[1] : null;
+  }
+
+  private applyMoveEdits(edits: MoveEdit[], workspaceRoot: string): void {
+    // Group edits by file for efficient processing
+    const editsByFile = new Map<string, MoveEdit[]>();
+    for (const edit of edits) {
+      const existing = editsByFile.get(edit.filePath) ?? [];
+      existing.push(edit);
+      editsByFile.set(edit.filePath, existing);
+    }
+
+    for (const [filePath, fileEdits] of editsByFile) {
+      const absolutePath = path.join(workspaceRoot, filePath);
+
+      for (const edit of fileEdits) {
+        switch (edit.action) {
+          case "remove_lines": {
+            if (!fs.existsSync(absolutePath)) continue;
+            const content = fs.readFileSync(absolutePath, "utf8");
+            const lines = content.split("\n");
+            const endLine = edit.endLine ?? edit.line;
+            // Remove the lines and any trailing blank line
+            const before = lines.slice(0, edit.line - 1);
+            const after = lines.slice(endLine);
+            // Remove a leading blank line from 'after' if present (clean up spacing)
+            if (after.length > 0 && after[0].trim() === "") {
+              after.shift();
+            }
+            fs.writeFileSync(absolutePath, before.concat(after).join("\n"), "utf8");
+            break;
+          }
+          case "insert_lines": {
+            if (fs.existsSync(absolutePath)) {
+              const content = fs.readFileSync(absolutePath, "utf8");
+              const newContent = content.trimEnd() + "\n\n" + edit.newText + "\n";
+              fs.writeFileSync(absolutePath, newContent, "utf8");
+            } else {
+              // Create the file
+              const dir = path.dirname(absolutePath);
+              if (!fs.existsSync(dir)) {
+                fs.mkdirSync(dir, { recursive: true });
+              }
+              fs.writeFileSync(absolutePath, edit.newText + "\n", "utf8");
+            }
+            break;
+          }
+          case "replace_import": {
+            if (!fs.existsSync(absolutePath)) continue;
+            const content = fs.readFileSync(absolutePath, "utf8");
+            const lines = content.split("\n");
+            const lineIndex = edit.line - 1;
+            if (lineIndex >= 0 && lineIndex < lines.length && edit.oldText) {
+              lines[lineIndex] = edit.newText;
+            }
+            fs.writeFileSync(absolutePath, lines.join("\n"), "utf8");
+            break;
+          }
+        }
+      }
+    }
   }
 
   private deduplicateEdits(edits: RenameEdit[]): RenameEdit[] {

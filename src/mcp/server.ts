@@ -18,6 +18,7 @@ import {
   findCallersOutputSchema,
   findCalleesOutputSchema,
   renameSymbolOutputSchema,
+  moveSymbolOutputSchema,
 } from "./schemas.js";
 
 const responseFormatSchema = z
@@ -581,6 +582,52 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         "Changes:",
         ...result.edits.map(
           (e) => `- ${e.filePath}:${e.line}:${e.column} \`${e.oldText}\` → \`${e.newText}\``,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      return makeResult(response_format, { ...result, _meta: meta }, markdown);
+    },
+  );
+
+  server.registerTool(
+    "codeintel_move_symbol",
+    {
+      title: "Move Symbol",
+      description:
+        "Move a symbol to a different file and update import paths. Defaults to dry-run mode.",
+      inputSchema: {
+        workspace_id: workspaceIdSchema,
+        symbol_id: z.string().min(3).describe("Symbol id to move."),
+        target_file_path: z.string().min(1).describe("Relative path within the workspace for the symbol's new location."),
+        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+        response_format: responseFormatSchema,
+      },
+      outputSchema: moveSymbolOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspace_id, symbol_id, target_file_path, dry_run, response_format }) => {
+      const startedAt = performance.now();
+      const result = service.moveSymbol(workspace_id, symbol_id, target_file_path, dry_run);
+      const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+      const markdown = [
+        `${dry_run ? "Preview" : "Applied"} move to \`${target_file_path}\``,
+        "",
+        `- Files affected: ${result.filesAffected}`,
+        result.warnings.length > 0
+          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+          : "",
+        "",
+        "Edits:",
+        ...result.edits.map(
+          (e) => `- [${e.action}] ${e.filePath}:${e.line}${e.endLine ? `-${e.endLine}` : ""}`,
         ),
       ]
         .filter(Boolean)

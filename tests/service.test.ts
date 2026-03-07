@@ -240,6 +240,60 @@ describe("CodeIntelService", () => {
     ).toBe(true);
   });
 
+  it("moves a symbol to a different file in dry-run and then applies", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    // Find the `multiply` function in src/math.ts
+    const multiplySymbol = service.searchSymbols({
+      workspaceId,
+      query: "multiply",
+      limit: 10,
+      offset: 0,
+    }).items.find((item) => item.name === "multiply");
+    expect(multiplySymbol).toBeDefined();
+
+    // Dry-run move to src/extra.ts
+    const dryResult = service.moveSymbol(workspaceId, multiplySymbol!.symbol_id, "src/extra.ts", true);
+    expect(dryResult.applied).toBe(false);
+    expect(dryResult.edits.length).toBeGreaterThanOrEqual(2);
+    expect(dryResult.edits.some((e) => e.filePath === "src/math.ts" && e.action === "remove_lines")).toBe(true);
+    expect(dryResult.edits.some((e) => e.filePath === "src/extra.ts" && e.action === "insert_lines")).toBe(true);
+
+    // Verify files are unchanged after dry run
+    const mathContent = fs.readFileSync(path.join(workspacePath, "src/math.ts"), "utf8");
+    expect(mathContent).toContain("function multiply(");
+    expect(fs.existsSync(path.join(workspacePath, "src/extra.ts"))).toBe(false);
+
+    // Apply the move
+    const applyResult = service.moveSymbol(workspaceId, multiplySymbol!.symbol_id, "src/extra.ts", false);
+    expect(applyResult.applied).toBe(true);
+    expect(applyResult.filesAffected).toBeGreaterThanOrEqual(2);
+
+    // Verify src/extra.ts exists and contains the function
+    const extraContent = fs.readFileSync(path.join(workspacePath, "src/extra.ts"), "utf8");
+    expect(extraContent).toContain("function multiply(");
+
+    // Verify src/math.ts no longer contains the function
+    const mathContentAfter = fs.readFileSync(path.join(workspacePath, "src/math.ts"), "utf8");
+    expect(mathContentAfter).not.toContain("function multiply(");
+    // Other symbols should still be present
+    expect(mathContentAfter).toContain("function add(");
+
+    // Re-indexing finds the symbol in the new location
+    const newSearch = service.searchSymbols({
+      workspaceId,
+      query: "multiply",
+      limit: 10,
+      offset: 0,
+    });
+    const movedSymbol = newSearch.items.find((item) => item.name === "multiply");
+    expect(movedSymbol).toBeDefined();
+    expect(movedSymbol!.file_path).toBe("src/extra.ts");
+  });
+
   it("refreshes an indexed workspace after a file change", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-lib");

@@ -237,3 +237,20 @@ export const renameSymbolOutputSchema = {
   applied: z.boolean(),
   _meta: metaSchema,
 } as const;
+
+export const moveSymbolOutputSchema = {
+  edits: z.array(
+    z.object({
+      filePath: z.string(),
+      action: z.enum(["remove_lines", "insert_lines", "replace_import"]),
+      line: z.number(),
+      endLine: z.optional(z.number()),
+      oldText: z.optional(z.string()),
+      newText: z.string(),
+    }),
+  ),
+  filesAffected: z.number(),
+  warnings: z.array(z.string()),
+  applied: z.boolean(),
+  _meta: metaSchema,
+} as const;
