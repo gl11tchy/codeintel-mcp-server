@@ -161,29 +161,20 @@ export class Resolver {
   }
 
   /**
-   * Scoped relation rebuild: only re-resolves relations for the changed files
-   * and their direct import dependents.
-   *
-   * Known limitation: the resolver also resolves references via `symbolsByName`
-   * when a symbol name is unique across the workspace. Adding or removing a
-   * symbol can therefore invalidate references in files that don't directly
-   * import the changed file. A full rebuild (`rebuildRelations` / the
-   * `codeintel_refresh_workspace --full` tool) is needed to fix stale
-   * unique-name references after symbols are added or removed.
+   * Scoped relation rebuild for a caller-provided set of affected files.
+   * The caller is responsible for expanding that set far enough to keep
+   * name-based resolution correct after symbol additions, removals, and renames.
    */
-  rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[], tsconfigPaths?: TsconfigPaths | null): void {
-    if (changedFilePaths.length === 0) return;
+  rebuildRelationsForFiles(workspace: WorkspaceConfig, affectedFilePaths: string[], tsconfigPaths?: TsconfigPaths | null): void {
+    if (affectedFilePaths.length === 0) return;
 
-    const dependentPaths = this.store.getFilesThatImportFrom(workspace.workspaceId, changedFilePaths);
-    const allAffectedPaths = [...new Set([...changedFilePaths, ...dependentPaths])];
-
-    this.store.deleteRelationsForFiles(workspace.workspaceId, allAffectedPaths);
+    this.store.deleteRelationsForFiles(workspace.workspaceId, affectedFilePaths);
 
     const allFiles = this.store.getFiles(workspace.workspaceId);
     const allSymbols = this.store.getSymbols(workspace.workspaceId);
     const maps = this.buildLookupMaps(allFiles, allSymbols);
 
-    const affectedSet = new Set(allAffectedPaths);
+    const affectedSet = new Set(affectedFilePaths);
     const affectedFiles = allFiles.filter((f) => affectedSet.has(f.filePath));
 
     const references: ResolvedReference[] = [];
@@ -200,6 +191,25 @@ export class Resolver {
     this.store.insertResolvedRelations(references, calls);
   }
 
+  resolveImportTargetFilePath(
+    workspace: WorkspaceConfig,
+    file: Pick<IndexedFile, "language" | "filePath">,
+    binding: ImportBinding,
+    knownFiles: Set<string>,
+    tsconfigPaths?: TsconfigPaths | null,
+  ): string | null {
+    let targetFilePath =
+      file.language === "python"
+        ? resolvePythonModule(file.filePath, binding.moduleSpecifier, knownFiles)
+        : resolveJsImport(workspace.rootPath, file.filePath, binding.moduleSpecifier, knownFiles);
+
+    if (!targetFilePath && file.language !== "python" && tsconfigPaths) {
+      targetFilePath = resolveAliasedImport(workspace.rootPath, tsconfigPaths, binding.moduleSpecifier, knownFiles);
+    }
+
+    return targetFilePath;
+  }
+
   resolveBindings(
     workspace: WorkspaceConfig,
     file: IndexedFile,
@@ -211,15 +221,7 @@ export class Resolver {
     const bindings = new Map<string, CandidateBinding>();
 
     for (const binding of file.imports) {
-      let targetFilePath =
-        file.language === "python"
-          ? resolvePythonModule(file.filePath, binding.moduleSpecifier, knownFiles)
-          : resolveJsImport(workspace.rootPath, file.filePath, binding.moduleSpecifier, knownFiles);
-
-      // Fall back to tsconfig paths alias resolution for JS/TS imports
-      if (!targetFilePath && file.language !== "python" && tsconfigPaths) {
-        targetFilePath = resolveAliasedImport(workspace.rootPath, tsconfigPaths, binding.moduleSpecifier, knownFiles);
-      }
+      const targetFilePath = this.resolveImportTargetFilePath(workspace, file, binding, knownFiles, tsconfigPaths);
 
       let targetSymbolId: string | null = null;
       let confidence: Confidence = "low";

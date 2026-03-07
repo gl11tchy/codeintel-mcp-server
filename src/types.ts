@@ -154,6 +154,11 @@ export interface WorkspaceSummary {
   watch_error: string | null;
 }
 
+export interface ParseIssueSummary {
+  parse_issue_count: number;
+  parse_issue_files: string[];
+}
+
 export interface SymbolSummary {
   symbol_id: string;
   file_path: string;
@@ -186,6 +191,12 @@ export interface OutlineNode {
   line: number;
   end_line: number;
   children: OutlineNode[];
+}
+
+export interface FileOutlineResult {
+  file_path: string;
+  parse_error: string | null;
+  items: OutlineNode[];
 }
 
 export interface PaginationEnvelope {

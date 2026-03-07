@@ -46,6 +46,13 @@ interface WorkspaceRow {
   watch_error: string | null;
 }
 
+interface WorkspaceControlFileRow {
+  workspace_id: string;
+  file_path: string;
+  is_present: number;
+  content_hash: string | null;
+}
+
 interface SymbolRow {
   symbol_id: string;
   workspace_id: string;
@@ -110,6 +117,15 @@ export class Store {
         references_json TEXT NOT NULL DEFAULT '[]',
         calls_json TEXT NOT NULL DEFAULT '[]',
         parse_error TEXT,
+        PRIMARY KEY (workspace_id, file_path),
+        FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS workspace_control_files (
+        workspace_id TEXT NOT NULL,
+        file_path TEXT NOT NULL,
+        is_present INTEGER NOT NULL,
+        content_hash TEXT,
         PRIMARY KEY (workspace_id, file_path),
         FOREIGN KEY (workspace_id) REFERENCES workspaces(workspace_id) ON DELETE CASCADE
       );
@@ -228,6 +244,50 @@ export class Store {
         indexedAt,
         indexedRevision,
       });
+  }
+
+  replaceWorkspaceControlFileStates(
+    workspaceId: string,
+    states: Array<{ filePath: string; isPresent: boolean; contentHash: string | null }>,
+  ): void {
+    const transaction = this.db.transaction(() => {
+      this.db.prepare("DELETE FROM workspace_control_files WHERE workspace_id = ?").run(workspaceId);
+      const insertState = this.db.prepare(`
+        INSERT INTO workspace_control_files (
+          workspace_id,
+          file_path,
+          is_present,
+          content_hash
+        ) VALUES (?, ?, ?, ?)
+      `);
+
+      for (const state of states) {
+        insertState.run(workspaceId, state.filePath, state.isPresent ? 1 : 0, state.contentHash);
+      }
+    });
+
+    transaction();
+  }
+
+  getWorkspaceControlFileStates(
+    workspaceId: string,
+  ): Array<{ filePath: string; isPresent: boolean; contentHash: string | null }> {
+    const rows = this.db
+      .prepare(
+        `
+          SELECT workspace_id, file_path, is_present, content_hash
+          FROM workspace_control_files
+          WHERE workspace_id = ?
+          ORDER BY file_path ASC
+        `,
+      )
+      .all(workspaceId) as WorkspaceControlFileRow[];
+
+    return rows.map((row) => ({
+      filePath: row.file_path,
+      isPresent: row.is_present === 1,
+      contentHash: row.content_hash,
+    }));
   }
 
   setWorkspaceWatchState(workspaceId: string, watchStatus: string, watchError: string | null): void {
@@ -492,20 +552,7 @@ export class Store {
       .prepare("SELECT * FROM files WHERE workspace_id = ? ORDER BY file_path ASC")
       .all(workspaceId) as FileRow[];
 
-    return rows.map((row) => ({
-      workspaceId: row.workspace_id,
-      filePath: row.file_path,
-      absolutePath: row.absolute_path,
-      language: row.language as IndexedFile["language"],
-      text: row.text,
-      size: row.size,
-      mtimeMs: row.mtime_ms,
-      hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
-      references: safeJsonParse<RawReference[]>(row.references_json, []),
-      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
-      parseError: row.parse_error,
-    }));
+    return rows.map((row) => this.mapFile(row));
   }
 
   getSymbols(workspaceId: string): CodeSymbol[] {
@@ -542,20 +589,20 @@ export class Store {
       return null;
     }
 
-    return {
-      workspaceId: row.workspace_id,
-      filePath: row.file_path,
-      absolutePath: row.absolute_path,
-      language: row.language as IndexedFile["language"],
-      text: row.text,
-      size: row.size,
-      mtimeMs: row.mtime_ms,
-      hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
-      references: safeJsonParse<RawReference[]>(row.references_json, []),
-      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
-      parseError: row.parse_error,
-    };
+    return this.mapFile(row);
+  }
+
+  getFilesWithParseErrors(workspaceId: string): Array<{ filePath: string; parseError: string }> {
+    return this.db
+      .prepare(
+        `
+          SELECT file_path AS filePath, parse_error AS parseError
+          FROM files
+          WHERE workspace_id = ? AND parse_error IS NOT NULL
+          ORDER BY file_path ASC
+        `,
+      )
+      .all(workspaceId) as Array<{ filePath: string; parseError: string }>;
   }
 
   replaceResolvedRelations(workspaceId: string, references: ResolvedReference[], calls: ResolvedCall[]): void {
@@ -823,24 +870,11 @@ export class Store {
                AND f.file_path = ft.file_path
               WHERE ft.workspace_id = ? AND file_fts MATCH ?
               LIMIT 200
-            `,
-          )
-          .all(workspaceId, sanitized) as FileRow[];
+        `,
+      )
+      .all(workspaceId, sanitized) as FileRow[];
         if (rows.length > 0) {
-          return rows.map((row) => ({
-            workspaceId: row.workspace_id,
-            filePath: row.file_path,
-            absolutePath: row.absolute_path,
-            language: row.language as IndexedFile["language"],
-            text: row.text,
-            size: row.size,
-            mtimeMs: row.mtime_ms,
-            hash: row.hash,
-            imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
-            references: safeJsonParse<RawReference[]>(row.references_json, []),
-            calls: safeJsonParse<RawCall[]>(row.calls_json, []),
-            parseError: row.parse_error,
-          }));
+          return rows.map((row) => this.mapFile(row));
         }
       } catch {
         // Fall back to the linear scan below.
@@ -857,20 +891,7 @@ export class Store {
       )
       .all(workspaceId, query) as FileRow[];
 
-    return rows.map((row) => ({
-      workspaceId: row.workspace_id,
-      filePath: row.file_path,
-      absolutePath: row.absolute_path,
-      language: row.language as IndexedFile["language"],
-      text: row.text,
-      size: row.size,
-      mtimeMs: row.mtime_ms,
-      hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
-      references: safeJsonParse<RawReference[]>(row.references_json, []),
-      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
-      parseError: row.parse_error,
-    }));
+    return rows.map((row) => this.mapFile(row));
   }
 
   deleteRelationsForFiles(workspaceId: string, filePaths: string[]): void {
@@ -888,22 +909,41 @@ export class Store {
     transaction();
   }
 
-  getFilesThatImportFrom(workspaceId: string, targetFilePaths: string[]): string[] {
-    if (targetFilePaths.length === 0) return [];
+  getFilesMentioningNames(workspaceId: string, names: string[]): string[] {
+    if (names.length === 0) {
+      return [];
+    }
 
-    const targetSet = new Set(targetFilePaths);
-    const likeClauses = targetFilePaths.map(() => "imports_json LIKE ?").join(" OR ");
-    const likeParams = targetFilePaths.map((fp) => `%${fp}%`);
-
+    const targetNames = new Set(names);
     const rows = this.db
       .prepare(
-        `SELECT DISTINCT file_path FROM files WHERE workspace_id = ? AND (${likeClauses})`,
+        `
+          SELECT file_path, references_json, calls_json
+          FROM files
+          WHERE workspace_id = ?
+          ORDER BY file_path ASC
+        `,
       )
-      .all(workspaceId, ...likeParams) as Array<{ file_path: string }>;
+      .all(workspaceId) as Array<{
+        file_path: string;
+        references_json: string;
+        calls_json: string;
+      }>;
 
-    return rows
-      .map((row) => row.file_path)
-      .filter((fp) => !targetSet.has(fp));
+    const matches = new Set<string>();
+    for (const row of rows) {
+      const references = safeJsonParse<RawReference[]>(row.references_json, []);
+      const calls = safeJsonParse<RawCall[]>(row.calls_json, []);
+      const mentionsName =
+        references.some((reference) => targetNames.has(reference.name))
+        || calls.some((call) => targetNames.has(call.calleeName));
+
+      if (mentionsName) {
+        matches.add(row.file_path);
+      }
+    }
+
+    return Array.from(matches).sort((left, right) => left.localeCompare(right));
   }
 
   private mapWorkspace(row: WorkspaceRow): WorkspaceRecord {
@@ -919,6 +959,23 @@ export class Store {
       symbolCount: row.symbol_count,
       watchStatus: row.watch_status,
       watchError: row.watch_error,
+    };
+  }
+
+  private mapFile(row: FileRow): IndexedFile {
+    return {
+      workspaceId: row.workspace_id,
+      filePath: row.file_path,
+      absolutePath: row.absolute_path,
+      language: row.language as IndexedFile["language"],
+      text: row.text,
+      size: row.size,
+      mtimeMs: row.mtime_ms,
+      hash: row.hash,
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
+      parseError: row.parse_error,
     };
   }
 

@@ -1,6 +1,6 @@
 <evaluation>
   <qa_pair>
-    <question>In the TypeScript fixture, one method both mutates a running numeric total and calls a helper that adds two numbers. What is that method's fully qualified name?</question>
+    <question>In the JavaScript fixture, which fully qualified method updates a running total by delegating to the helper named add? Answer with the fully qualified method name only.</question>
     <answer>Calculator.addToTotal</answer>
   </qa_pair>
   <qa_pair>
@@ -36,7 +36,7 @@
     <answer>slugify</answer>
   </qa_pair>
   <qa_pair>
-    <question>In the TypeScript fixture, which arithmetic helper multiplies its two inputs? Answer with the function name only.</question>
-    <answer>multiply</answer>
+    <question>In the JavaScript fixture, which file reports parser recovery instead of a clean parse? Answer with the relative file path only.</question>
+    <answer>src/broken.js</answer>
   </qa_pair>
 </evaluation>

@@ -101,6 +101,8 @@ const outlineNodeSchema: z.ZodType<{
 export const indexWorkspaceOutputSchema = {
   workspace: workspaceSummarySchema,
   languages: languageCountsSchema,
+  parse_issue_count: z.number(),
+  parse_issue_files: z.array(z.string()),
   _meta: metaSchema,
 } as const;
 
@@ -116,6 +118,8 @@ export const listWorkspacesOutputSchema = {
 export const getWorkspaceStatusOutputSchema = {
   workspace: workspaceSummarySchema,
   languages: languageCountsSchema,
+  parse_issue_count: z.number(),
+  parse_issue_files: z.array(z.string()),
   dirty: z.boolean(),
   pending_change_count: z.number(),
   pending_changed_files: z.array(z.string()),
@@ -127,6 +131,8 @@ export const getWorkspaceStatusOutputSchema = {
 export const refreshWorkspaceOutputSchema = {
   workspace: workspaceSummarySchema,
   languages: languageCountsSchema,
+  parse_issue_count: z.number(),
+  parse_issue_files: z.array(z.string()),
   _meta: metaSchema,
 } as const;
 
@@ -137,6 +143,7 @@ export const getFileTreeOutputSchema = {
 
 export const getFileOutlineOutputSchema = {
   file_path: z.string(),
+  parse_error: z.nullable(z.string()),
   items: z.array(outlineNodeSchema),
   _meta: metaSchema,
 } as const;

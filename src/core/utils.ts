@@ -156,21 +156,39 @@ export function estimateTokens(text: string): number {
   return Math.max(1, Math.ceil(text.length / 4));
 }
 
-export function readGitRevision(rootPath: string): string {
+export function resolveGitDir(rootPath: string): string | null {
   const gitEntryPath = path.join(rootPath, ".git");
   if (!fs.existsSync(gitEntryPath)) {
-    return "";
+    return null;
   }
 
-  let gitDir = gitEntryPath;
   const stat = fs.statSync(gitEntryPath);
-  if (stat.isFile()) {
-    const pointer = fs.readFileSync(gitEntryPath, "utf8").trim();
-    const match = pointer.match(/^gitdir:\s+(.+)$/);
-    if (!match) {
-      return "";
-    }
-    gitDir = path.resolve(rootPath, match[1]);
+  if (!stat.isFile()) {
+    return gitEntryPath;
+  }
+
+  const pointer = fs.readFileSync(gitEntryPath, "utf8").trim();
+  const match = pointer.match(/^gitdir:\s+(.+)$/);
+  return match ? path.resolve(rootPath, match[1]) : null;
+}
+
+export function getGitWatchPaths(rootPath: string): string[] {
+  const gitDir = resolveGitDir(rootPath);
+  if (!gitDir) {
+    return [];
+  }
+
+  return [
+    path.join(gitDir, "HEAD"),
+    path.join(gitDir, "refs"),
+    path.join(gitDir, "packed-refs"),
+  ];
+}
+
+export function readGitRevision(rootPath: string): string {
+  const gitDir = resolveGitDir(rootPath);
+  if (!gitDir) {
+    return "";
   }
 
   const headPath = path.join(gitDir, "HEAD");

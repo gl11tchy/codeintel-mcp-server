@@ -54,6 +54,17 @@ function renderOutline(nodes: OutlineNode[], depth = 0): string {
     .join("\n");
 }
 
+function renderParseIssues(parseIssueCount: number, parseIssueFiles: string[]): string[] {
+  if (parseIssueCount === 0) {
+    return ["- Parse issues: 0"];
+  }
+
+  return [
+    `- Parse issues: ${parseIssueCount}`,
+    ...parseIssueFiles.map((filePath) => `  - ${filePath}`),
+  ];
+}
+
 function renderAsText(data: unknown): string {
   return JSON.stringify(data, null, 2);
 }
@@ -87,7 +98,11 @@ function metaWithPagination(meta: MetaEnvelope, pagination?: { total_count: numb
     : meta;
 }
 
-export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
+export function createCodeIntelMcpServer(
+  service: CodeIntelService,
+  options?: { enableRefactors?: boolean },
+): McpServer {
+  const enableRefactors = options?.enableRefactors ?? false;
   const server = new McpServer(
     {
       name: "codeintel-mcp-server",
@@ -123,10 +138,20 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         followGitignore: follow_gitignore,
       });
       const meta = service.metaForWorkspace(result.workspace.workspace_id, startedAt, { estimated_tokens_avoided: 0 });
+      const parseIssueLines = renderParseIssues(result.parse_issue_count, result.parse_issue_files);
       return makeResult(
         response_format,
         { ...result, _meta: meta },
-        `Indexed \`${result.workspace.display_name}\` at \`${result.workspace.root_path}\`.\n\n- Workspace ID: \`${result.workspace.workspace_id}\`\n- Files: ${result.workspace.file_count}\n- Symbols: ${result.workspace.symbol_count}\n- Git revision: \`${result.workspace.indexed_revision || "n/a"}\`\n- Watch status: ${result.workspace.watch_status}`,
+        [
+          `Indexed \`${result.workspace.display_name}\` at \`${result.workspace.root_path}\`.`,
+          "",
+          `- Workspace ID: \`${result.workspace.workspace_id}\``,
+          `- Files: ${result.workspace.file_count}`,
+          `- Symbols: ${result.workspace.symbol_count}`,
+          `- Git revision: \`${result.workspace.indexed_revision || "n/a"}\``,
+          `- Watch status: ${result.workspace.watch_status}`,
+          ...parseIssueLines,
+        ].join("\n"),
       );
     },
   );
@@ -194,6 +219,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         `- Dirty: ${result.dirty}`,
         `- Pending changes: ${result.pending_change_count}`,
         `- Watch status: ${result.workspace.watch_status}`,
+        ...renderParseIssues(result.parse_issue_count, result.parse_issue_files),
       ].join("\n");
       return makeResult(response_format, { ...result, _meta: meta }, markdown);
     },
@@ -221,10 +247,18 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       const startedAt = performance.now();
       const result = await service.refreshWorkspace(workspace_id, full);
       const meta = service.metaForWorkspace(workspace_id, startedAt, { estimated_tokens_avoided: 0 });
+      const parseIssueLines = renderParseIssues(result.parse_issue_count, result.parse_issue_files);
       return makeResult(
         response_format,
         { ...result, _meta: meta },
-        `${full ? "Rebuilt" : "Refreshed"} \`${result.workspace.display_name}\`.\n\n- Files: ${result.workspace.file_count}\n- Symbols: ${result.workspace.symbol_count}\n- Watch status: ${result.workspace.watch_status}`,
+        [
+          `${full ? "Rebuilt" : "Refreshed"} \`${result.workspace.display_name}\`.`,
+          "",
+          `- Files: ${result.workspace.file_count}`,
+          `- Symbols: ${result.workspace.symbol_count}`,
+          `- Watch status: ${result.workspace.watch_status}`,
+          ...parseIssueLines,
+        ].join("\n"),
       );
     },
   );
@@ -281,12 +315,18 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
     },
     async ({ workspace_id, file_path, response_format }) => {
       const startedAt = performance.now();
-      const items = service.getFileOutline(workspace_id, file_path);
+      const result = service.getFileOutline(workspace_id, file_path);
       const meta = service.metaForWorkspace(workspace_id, startedAt, { estimated_tokens_avoided: 0 });
+      const markdown = [
+        result.parse_error ? `Parse recovery: ${result.parse_error}` : "",
+        result.items.length ? renderOutline(result.items) : `No indexed symbols found for \`${file_path}\`.`,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       return makeResult(
         response_format,
-        { file_path, items, _meta: meta },
-        items.length ? renderOutline(items) : `No indexed symbols found for \`${file_path}\`.`,
+        { ...result, _meta: meta },
+        markdown,
       );
     },
   );
@@ -544,98 +584,100 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
     },
   );
 
-  server.registerTool(
-    "codeintel_rename_symbol",
-    {
-      title: "Rename Symbol",
-      description:
-        "Rename a symbol and update all resolved references across the workspace. Defaults to dry-run mode.",
-      inputSchema: {
-        workspace_id: workspaceIdSchema,
-        symbol_id: z.string().min(3).describe("Stable symbol id to rename."),
-        new_name: z.string().min(1).describe("New name for the symbol."),
-        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
-        response_format: responseFormatSchema,
+  if (enableRefactors) {
+    server.registerTool(
+      "codeintel_rename_symbol",
+      {
+        title: "Rename Symbol",
+        description:
+          "Rename a symbol and update all resolved references across the workspace. Defaults to dry-run mode.",
+        inputSchema: {
+          workspace_id: workspaceIdSchema,
+          symbol_id: z.string().min(3).describe("Stable symbol id to rename."),
+          new_name: z.string().min(1).describe("New name for the symbol."),
+          dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+          response_format: responseFormatSchema,
+        },
+        outputSchema: renameSymbolOutputSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
       },
-      outputSchema: renameSymbolOutputSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: false,
-        openWorldHint: false,
+      async ({ workspace_id, symbol_id, new_name, dry_run, response_format }) => {
+        const startedAt = performance.now();
+        const result = service.renameSymbol(workspace_id, symbol_id, new_name, dry_run);
+        const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+        const markdown = [
+          `${dry_run ? "Preview" : "Applied"} rename: \`${result.edits[0]?.oldText}\` → \`${new_name}\``,
+          "",
+          `- Files affected: ${result.filesAffected}`,
+          `- References updated: ${result.referencesUpdated}`,
+          result.warnings.length > 0
+            ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+            : "",
+          "",
+          "Changes:",
+          ...result.edits.map(
+            (e) => `- ${e.filePath}:${e.line}:${e.column} \`${e.oldText}\` → \`${e.newText}\``,
+          ),
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        return makeResult(response_format, { ...result, _meta: meta }, markdown);
       },
-    },
-    async ({ workspace_id, symbol_id, new_name, dry_run, response_format }) => {
-      const startedAt = performance.now();
-      const result = service.renameSymbol(workspace_id, symbol_id, new_name, dry_run);
-      const meta = service.metaForWorkspace(workspace_id, startedAt);
+    );
 
-      const markdown = [
-        `${dry_run ? "Preview" : "Applied"} rename: \`${result.edits[0]?.oldText}\` → \`${new_name}\``,
-        "",
-        `- Files affected: ${result.filesAffected}`,
-        `- References updated: ${result.referencesUpdated}`,
-        result.warnings.length > 0
-          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
-          : "",
-        "",
-        "Changes:",
-        ...result.edits.map(
-          (e) => `- ${e.filePath}:${e.line}:${e.column} \`${e.oldText}\` → \`${e.newText}\``,
-        ),
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      return makeResult(response_format, { ...result, _meta: meta }, markdown);
-    },
-  );
-
-  server.registerTool(
-    "codeintel_move_symbol",
-    {
-      title: "Move Symbol",
-      description:
-        "Move a symbol to a different file and update import paths. Defaults to dry-run mode.",
-      inputSchema: {
-        workspace_id: workspaceIdSchema,
-        symbol_id: z.string().min(3).describe("Symbol id to move."),
-        target_file_path: z.string().min(1).describe("Relative path within the workspace for the symbol's new location."),
-        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
-        response_format: responseFormatSchema,
+    server.registerTool(
+      "codeintel_move_symbol",
+      {
+        title: "Move Symbol",
+        description:
+          "Move a symbol to a different file and update import paths. Defaults to dry-run mode.",
+        inputSchema: {
+          workspace_id: workspaceIdSchema,
+          symbol_id: z.string().min(3).describe("Symbol id to move."),
+          target_file_path: z.string().min(1).describe("Relative path within the workspace for the symbol's new location."),
+          dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+          response_format: responseFormatSchema,
+        },
+        outputSchema: moveSymbolOutputSchema,
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
       },
-      outputSchema: moveSymbolOutputSchema,
-      annotations: {
-        readOnlyHint: false,
-        destructiveHint: true,
-        idempotentHint: false,
-        openWorldHint: false,
+      async ({ workspace_id, symbol_id, target_file_path, dry_run, response_format }) => {
+        const startedAt = performance.now();
+        const result = service.moveSymbol(workspace_id, symbol_id, target_file_path, dry_run);
+        const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+        const markdown = [
+          `${dry_run ? "Preview" : "Applied"} move to \`${target_file_path}\``,
+          "",
+          `- Files affected: ${result.filesAffected}`,
+          result.warnings.length > 0
+            ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+            : "",
+          "",
+          "Edits:",
+          ...result.edits.map(
+            (e) => `- [${e.action}] ${e.filePath}:${e.line}${e.endLine ? `-${e.endLine}` : ""}`,
+          ),
+        ]
+          .filter(Boolean)
+          .join("\n");
+
+        return makeResult(response_format, { ...result, _meta: meta }, markdown);
       },
-    },
-    async ({ workspace_id, symbol_id, target_file_path, dry_run, response_format }) => {
-      const startedAt = performance.now();
-      const result = service.moveSymbol(workspace_id, symbol_id, target_file_path, dry_run);
-      const meta = service.metaForWorkspace(workspace_id, startedAt);
-
-      const markdown = [
-        `${dry_run ? "Preview" : "Applied"} move to \`${target_file_path}\``,
-        "",
-        `- Files affected: ${result.filesAffected}`,
-        result.warnings.length > 0
-          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
-          : "",
-        "",
-        "Edits:",
-        ...result.edits.map(
-          (e) => `- [${e.action}] ${e.filePath}:${e.line}${e.endLine ? `-${e.endLine}` : ""}`,
-        ),
-      ]
-        .filter(Boolean)
-        .join("\n");
-
-      return makeResult(response_format, { ...result, _meta: meta }, markdown);
-    },
-  );
+    );
+  }
 
   // ---------------------------------------------------------------------------
   // Resources
@@ -764,6 +806,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
                 file_path: file.filePath,
                 language: file.language,
                 size: file.size,
+                parse_error: file.parseError,
                 content: file.text,
                 outline,
               },

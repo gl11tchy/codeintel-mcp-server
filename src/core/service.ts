@@ -1,4 +1,3 @@
-import fs from "node:fs";
 import path from "node:path";
 
 import { minimatch } from "minimatch";
@@ -7,10 +6,12 @@ import { Store } from "../db/store.js";
 import type {
   CodeSymbol,
   Confidence,
+  FileOutlineResult,
   FileTreeNode,
   MetaEnvelope,
   OutlineNode,
   PaginationEnvelope,
+  ParseIssueSummary,
   SearchSymbolFilters,
   SearchTextFilters,
   SupportedLanguage,
@@ -22,12 +23,10 @@ import type {
 import { Indexer } from "./indexer.js";
 import { Refactor, type RenameResult, type MoveResult } from "./refactor.js";
 import { Resolver } from "./resolver.js";
-import { readTsconfigPaths } from "./tsconfig.js";
 import {
   ensureDir,
   findGitRoot,
   getPaths,
-  readGitRevision,
   relativeWorkspacePath,
   stableWorkspaceId,
 } from "./utils.js";
@@ -137,7 +136,6 @@ export class CodeIntelService {
   readonly dbPath: string;
   readonly enableWatch: boolean;
   private readonly indexer: Indexer;
-  private readonly resolver: Resolver;
   private readonly refactor: Refactor;
   private _closed = false;
 
@@ -148,12 +146,12 @@ export class CodeIntelService {
     this.dbPath = options?.dbPath ?? path.join(paths.cache, "codeintel.sqlite");
     this.enableWatch = options?.enableWatch ?? true;
     this.store = new Store(this.dbPath);
-    this.resolver = new Resolver(this.store);
+    const resolver = new Resolver(this.store);
     this.refactor = new Refactor(this.store);
     this.indexer = new Indexer(
       this.store,
       this.enableWatch,
-      this.resolver,
+      resolver,
       (workspaceId) => this.requireWorkspace(workspaceId),
     );
   }
@@ -182,7 +180,7 @@ export class CodeIntelService {
     const record = this.requireWorkspace(workspaceId);
     return {
       workspace: workspaceSummary(record),
-      languages: this.languageCounts(workspaceId),
+      ...this.workspaceDiagnostics(workspaceId),
     };
   }
 
@@ -196,7 +194,7 @@ export class CodeIntelService {
     const record = this.requireWorkspace(workspaceId);
     return {
       workspace: workspaceSummary(record),
-      languages: this.languageCounts(workspaceId),
+      ...this.workspaceDiagnostics(workspaceId),
     };
   }
 
@@ -210,17 +208,23 @@ export class CodeIntelService {
   getWorkspaceStatus(workspaceId: string) {
     const workspace = this.requireWorkspace(workspaceId);
     const dirty = this.indexer.detectDirtyWorkspace(workspace);
-    const currentRevision = readGitRevision(workspace.rootPath);
     return {
       workspace: workspaceSummary(workspace),
-      languages: this.languageCounts(workspaceId),
-      dirty: dirty.changedAbsolutePaths.length > 0 || dirty.removedFilePaths.length > 0 || currentRevision !== workspace.indexedRevision,
-      pending_change_count: dirty.changedAbsolutePaths.length + dirty.removedFilePaths.length,
-      pending_changed_files: dirty.changedAbsolutePaths
-        .map((absolutePath) => relativeWorkspacePath(workspace.rootPath, absolutePath))
-        .slice(0, 20),
+      ...this.workspaceDiagnostics(workspaceId),
+      dirty:
+        dirty.changedAbsolutePaths.length > 0
+        || dirty.removedFilePaths.length > 0
+        || dirty.changedControlFiles.length > 0,
+      pending_change_count:
+        dirty.changedAbsolutePaths.length
+        + dirty.removedFilePaths.length
+        + dirty.changedControlFiles.length,
+      pending_changed_files: [
+        ...dirty.changedAbsolutePaths.map((absolutePath) => relativeWorkspacePath(workspace.rootPath, absolutePath)),
+        ...dirty.changedControlFiles,
+      ].slice(0, 20),
       pending_removed_files: dirty.removedFilePaths.slice(0, 20),
-      current_git_revision: currentRevision,
+      current_git_revision: dirty.currentGitRevision,
     };
   }
 
@@ -277,8 +281,9 @@ export class CodeIntelService {
     return root.children ?? [];
   }
 
-  getFileOutline(workspaceId: string, filePath: string) {
+  getFileOutline(workspaceId: string, filePath: string): FileOutlineResult {
     this.requireWorkspace(workspaceId);
+    const file = this.store.getFile(workspaceId, filePath);
     const symbols = this.store.getFileSymbols(workspaceId, filePath);
     const nodesById = new Map<string, OutlineNode>();
     const roots: OutlineNode[] = [];
@@ -306,7 +311,11 @@ export class CodeIntelService {
       }
     }
 
-    return roots;
+    return {
+      file_path: filePath,
+      parse_error: file?.parseError ?? null,
+      items: roots,
+    };
   }
 
   searchSymbols(filters: SearchSymbolFilters) {
@@ -610,18 +619,35 @@ export class CodeIntelService {
     return result;
   }
 
+  private workspaceDiagnostics(workspaceId: string): { languages: Record<string, number> } & ParseIssueSummary {
+    return {
+      languages: this.languageCounts(workspaceId),
+      ...this.parseIssueSummary(workspaceId),
+    };
+  }
+
+  private parseIssueSummary(workspaceId: string): ParseIssueSummary {
+    const parseIssueFiles = this.store
+      .getFilesWithParseErrors(workspaceId)
+      .map((item) => item.filePath);
+
+    return {
+      parse_issue_count: parseIssueFiles.length,
+      parse_issue_files: parseIssueFiles.slice(0, 20),
+    };
+  }
+
   private reindexAfterRefactor(workspace: WorkspaceRecord, editedFilePaths: string[]): void {
     const affectedPaths = [...new Set(editedFilePaths)];
     try {
-      for (const filePath of affectedPaths) {
-        const absolutePath = path.join(workspace.rootPath, filePath);
-        if (fs.existsSync(absolutePath)) {
-          this.indexer.indexAbsoluteFile(workspace, absolutePath);
-        }
-      }
-      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
-      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
-      this.store.updateWorkspaceCounts(workspace.workspaceId);
+      this.indexer.applyWorkspaceFileChanges(
+        workspace,
+        {
+          changedAbsolutePaths: affectedPaths.map((filePath) => path.join(workspace.rootPath, filePath)),
+          removedFilePaths: [],
+        },
+        { updateRevision: false },
+      );
     } catch {
       // Edits were already applied to disk; mark workspace stale so the next
       // refresh picks up the divergence rather than silently staying out of sync.
