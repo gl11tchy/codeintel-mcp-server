@@ -5,7 +5,8 @@ export type SymbolKind =
   | "class"
   | "method"
   | "type"
-  | "constant";
+  | "constant"
+  | "property";
 
 export type ResponseFormat = "markdown" | "json";
 

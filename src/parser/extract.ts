@@ -146,6 +146,32 @@ function maybeCreateJsSymbol(
       }
       break;
     }
+    case "enum_assignment": {
+      // Enum member with explicit value: `Up = 'UP'`
+      nameNode = node.childForFieldName("name");
+      kind = "constant";
+      break;
+    }
+    case "property_identifier": {
+      // Simple enum member without value: `First` (direct child of enum_body)
+      if (node.parent?.type === "enum_body") {
+        kind = "constant";
+        nameNode = node;
+      }
+      break;
+    }
+    case "property_signature": {
+      // Interface/type property: `name: string`
+      nameNode = node.childForFieldName("name");
+      kind = "property";
+      break;
+    }
+    case "method_signature": {
+      // Interface/type method: `getName(): string`
+      nameNode = node.childForFieldName("name");
+      kind = "method";
+      break;
+    }
     default:
       break;
   }
@@ -604,6 +630,9 @@ function shouldSkipJsReference(node: SyntaxNode): boolean {
       "interface_declaration",
       "type_alias_declaration",
       "enum_declaration",
+      "enum_assignment",
+      "property_signature",
+      "method_signature",
       "variable_declarator",
       "required_parameter",
       "optional_parameter",
@@ -620,11 +649,29 @@ function shouldSkipJsReference(node: SyntaxNode): boolean {
     }
   }
 
+  // Simple enum members (property_identifier directly inside enum_body)
+  if (parent.type === "enum_body") {
+    return true;
+  }
+
   if (parent.type === "member_expression" && fieldEquals(parent, "object", node)) {
     return true;
   }
 
   if (parent.type === "pair" && parent.childForFieldName("key")?.id === node.id) {
+    return true;
+  }
+
+  // Skip JSX closing element identifiers (duplicates the opening element)
+  if (parent.type === "jsx_closing_element") {
+    return true;
+  }
+
+  // Skip lowercase JSX tag identifiers (HTML elements like div, span)
+  if (
+    (parent.type === "jsx_opening_element" || parent.type === "jsx_self_closing_element") &&
+    /^[a-z]/.test(node.text)
+  ) {
     return true;
   }
 
