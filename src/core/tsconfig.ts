@@ -6,21 +6,57 @@ export interface TsconfigPaths {
   paths: Record<string, string[]>;
 }
 
+function parseTsconfigFile(configPath: string): Record<string, unknown> | null {
+  try {
+    const raw = fs.readFileSync(configPath, "utf8");
+    // Strip comments (// and /* */) — tsconfig allows them
+    const stripped = raw.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
+    return JSON.parse(stripped);
+  } catch {
+    return null;
+  }
+}
+
+function resolveExtendsChain(configPath: string, maxDepth = 5): Record<string, unknown> {
+  let mergedCompilerOptions: Record<string, unknown> = {};
+
+  let currentPath = configPath;
+  for (let depth = 0; depth < maxDepth; depth++) {
+    const config = parseTsconfigFile(currentPath);
+    if (!config) break;
+
+    const currentOptions = (config.compilerOptions ?? {}) as Record<string, unknown>;
+    // Child overrides base: spread current (base) first, then accumulated child on top
+    mergedCompilerOptions = { ...currentOptions, ...mergedCompilerOptions };
+
+    const extendsValue = config.extends;
+    if (typeof extendsValue !== "string") break;
+
+    const currentDir = path.dirname(currentPath);
+    currentPath = extendsValue.endsWith(".json")
+      ? path.resolve(currentDir, extendsValue)
+      : path.resolve(currentDir, `${extendsValue}.json`);
+    if (!fs.existsSync(currentPath) && !extendsValue.endsWith(".json")) {
+      // Try without appending .json (the original path might resolve as-is via node_modules, etc.)
+      currentPath = path.resolve(currentDir, extendsValue);
+    }
+    if (!fs.existsSync(currentPath)) break;
+  }
+
+  return mergedCompilerOptions;
+}
+
 export function readTsconfigPaths(workspaceRoot: string): TsconfigPaths | null {
   for (const filename of ["tsconfig.json", "jsconfig.json"]) {
     const configPath = path.join(workspaceRoot, filename);
     if (!fs.existsSync(configPath)) continue;
 
     try {
-      const raw = fs.readFileSync(configPath, "utf8");
-      // Strip comments (// and /* */) — tsconfig allows them
-      const stripped = raw.replace(/\/\/.*$/gm, "").replace(/\/\*[\s\S]*?\*\//g, "");
-      const config = JSON.parse(stripped);
-      const compilerOptions = config.compilerOptions ?? {};
-      const baseUrl = compilerOptions.baseUrl ?? ".";
-      const paths = compilerOptions.paths ?? {};
+      const compilerOptions = resolveExtendsChain(configPath);
+      const baseUrl = (compilerOptions.baseUrl as string) ?? ".";
+      const paths = (compilerOptions.paths as Record<string, string[]>) ?? {};
 
-      if (Object.keys(paths).length === 0 && baseUrl === ".") {
+      if (Object.keys(paths).length === 0 && !compilerOptions.baseUrl) {
         return null;
       }
 
@@ -30,6 +66,16 @@ export function readTsconfigPaths(workspaceRoot: string): TsconfigPaths | null {
     }
   }
   return null;
+}
+
+const RESOLVE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+
+function buildCandidates(basePath: string): string[] {
+  return [
+    basePath,
+    ...RESOLVE_EXTENSIONS.map(ext => `${basePath}${ext}`),
+    ...RESOLVE_EXTENSIONS.map(ext => `${basePath}/index${ext}`),
+  ];
 }
 
 export function resolveAliasedImport(
@@ -58,19 +104,7 @@ export function resolveAliasedImport(
         const relativePath = path.relative(workspaceRoot, absoluteResolved);
         const posixRelative = relativePath.split(path.sep).join("/");
 
-        const candidates = [
-          posixRelative,
-          `${posixRelative}.ts`,
-          `${posixRelative}.tsx`,
-          `${posixRelative}.js`,
-          `${posixRelative}.jsx`,
-          `${posixRelative}/index.ts`,
-          `${posixRelative}/index.tsx`,
-          `${posixRelative}/index.js`,
-          `${posixRelative}/index.jsx`,
-        ];
-
-        for (const candidate of candidates) {
+        for (const candidate of buildCandidates(posixRelative)) {
           if (knownFiles.has(candidate)) return candidate;
         }
       }
@@ -81,14 +115,7 @@ export function resolveAliasedImport(
         const relativePath = path.relative(workspaceRoot, absoluteResolved);
         const posixRelative = relativePath.split(path.sep).join("/");
 
-        const candidates = [
-          posixRelative,
-          `${posixRelative}.ts`,
-          `${posixRelative}.tsx`,
-          `${posixRelative}.js`,
-          `${posixRelative}/index.ts`,
-        ];
-        for (const candidate of candidates) {
+        for (const candidate of buildCandidates(posixRelative)) {
           if (knownFiles.has(candidate)) return candidate;
         }
       }
@@ -96,18 +123,12 @@ export function resolveAliasedImport(
   }
 
   // Try baseUrl resolution (imports relative to baseUrl without explicit paths entry)
-  if (tsconfigPaths.baseUrl !== ".") {
+  {
     const absoluteResolved = path.resolve(absoluteBaseUrl, moduleSpecifier);
     const relativePath = path.relative(workspaceRoot, absoluteResolved);
     const posixRelative = relativePath.split(path.sep).join("/");
 
-    const candidates = [
-      posixRelative,
-      `${posixRelative}.ts`,
-      `${posixRelative}.tsx`,
-      `${posixRelative}.js`,
-    ];
-    for (const candidate of candidates) {
+    for (const candidate of buildCandidates(posixRelative)) {
       if (knownFiles.has(candidate)) return candidate;
     }
   }

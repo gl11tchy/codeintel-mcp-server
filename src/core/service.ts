@@ -22,6 +22,7 @@ import type {
 import { Indexer } from "./indexer.js";
 import { Refactor, type RenameResult, type MoveResult } from "./refactor.js";
 import { Resolver } from "./resolver.js";
+import { readTsconfigPaths } from "./tsconfig.js";
 import {
   ensureDir,
   findGitRoot,
@@ -599,7 +600,8 @@ export class CodeIntelService {
           this.indexer.indexAbsoluteFile(workspace, absolutePath);
         }
       }
-      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths);
+      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
+      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
       this.store.updateWorkspaceCounts(workspaceId);
     }
 
@@ -618,7 +620,8 @@ export class CodeIntelService {
           this.indexer.indexAbsoluteFile(workspace, absolutePath);
         }
       }
-      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths);
+      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
+      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
       this.store.updateWorkspaceCounts(workspaceId);
     }
 

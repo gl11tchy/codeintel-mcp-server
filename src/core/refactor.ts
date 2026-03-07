@@ -112,6 +112,13 @@ export class Refactor {
     dryRun: boolean,
     workspaceRoot: string,
   ): MoveResult {
+    // Validate that the target path stays within the workspace (prevent path traversal)
+    const normalizedRoot = path.resolve(workspaceRoot);
+    const targetAbsolutePath = path.resolve(workspaceRoot, targetFilePath);
+    if (!targetAbsolutePath.startsWith(normalizedRoot + path.sep) && targetAbsolutePath !== normalizedRoot) {
+      throw new Error(`Target file must stay within the workspace: ${targetFilePath}`);
+    }
+
     const symbol = this.store.getSymbol(symbolId);
     if (!symbol || symbol.workspaceId !== workspaceId) {
       throw new Error(`Symbol not found: ${symbolId}`);
@@ -135,7 +142,6 @@ export class Refactor {
     const symbolText = sourceLines.slice(symbol.line - 1, symbol.endLine).join("\n");
 
     // Check if target file already has a symbol with the same name
-    const targetAbsolutePath = path.join(workspaceRoot, targetFilePath);
     if (fs.existsSync(targetAbsolutePath)) {
       const targetContent = fs.readFileSync(targetAbsolutePath, "utf8");
       // Simple check: look for the symbol name as a declaration
@@ -225,13 +231,34 @@ export class Refactor {
   }
 
   private extractImportedNames(importLine: string): string[] {
-    // Match `{ name1, name2 }` or `{ name1 as alias, name2 }` patterns
+    const names: string[] = [];
+
+    // Match default import: "import Foo" or "import Foo," (before { or from)
+    const defaultMatch = importLine.match(/import\s+(?:type\s+)?([A-Za-z_$][\w$]*)\s*(?:,|\s+from)/);
+    if (defaultMatch && defaultMatch[1] !== "type") {
+      names.push(defaultMatch[1]);
+    }
+
+    // Match namespace import: "import * as Foo"
+    const namespaceMatch = importLine.match(/\*\s+as\s+([A-Za-z_$][\w$]*)/);
+    if (namespaceMatch) {
+      names.push(namespaceMatch[1]);
+    }
+
+    // Match named imports: "{ foo, bar as baz }"
     const braceMatch = importLine.match(/\{([^}]+)\}/);
-    if (!braceMatch) return [];
-    return braceMatch[1]
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
+    if (braceMatch) {
+      const namedImports = braceMatch[1]
+        .split(",")
+        .map((s) => {
+          const parts = s.trim().split(/\s+as\s+/);
+          return parts[0]?.trim();
+        })
+        .filter(Boolean);
+      names.push(...namedImports);
+    }
+
+    return names;
   }
 
   private extractModuleSpecifier(importLine: string): string | null {

@@ -560,7 +560,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       outputSchema: renameSymbolOutputSchema,
       annotations: {
         readOnlyHint: false,
-        destructiveHint: false,
+        destructiveHint: true,
         idempotentHint: false,
         openWorldHint: false,
       },
@@ -607,7 +607,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       outputSchema: moveSymbolOutputSchema,
       annotations: {
         readOnlyHint: false,
-        destructiveHint: false,
+        destructiveHint: true,
         idempotentHint: false,
         openWorldHint: false,
       },

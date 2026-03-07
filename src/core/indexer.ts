@@ -179,21 +179,26 @@ export class Indexer {
     return { changedAbsolutePaths, removedFilePaths };
   }
 
-  indexAbsoluteFile(config: WorkspaceConfig, absolutePath: string): void {
+  /**
+   * Index a single file. Returns `true` if the file was indexed, `false` if it
+   * was skipped due to eligibility checks (non-indexable language, secret path,
+   * oversized, binary content).
+   */
+  indexAbsoluteFile(config: WorkspaceConfig, absolutePath: string): boolean {
     const relativePath = relativeWorkspacePath(config.rootPath, absolutePath);
     const language = languageFromFilePath(relativePath);
     if (!language || isSecretLikePath(relativePath)) {
-      return;
+      return false;
     }
 
     const stats = fs.statSync(absolutePath);
     if (!stats.isFile() || stats.size > MAX_FILE_BYTES) {
-      return;
+      return false;
     }
 
     const text = fs.readFileSync(absolutePath, "utf8");
     if (isBinaryContent(text)) {
-      return;
+      return false;
     }
 
     const parsed = parseFile(config.workspaceId, relativePath, text, language);
@@ -213,6 +218,7 @@ export class Indexer {
     };
 
     this.store.saveIndexedFile(indexedFile, parsed.symbols);
+    return true;
   }
 
   private ensureWatcher(workspace: WorkspaceConfig): void {
@@ -290,22 +296,23 @@ export class Indexer {
       return;
     }
 
-    if (state.fullRefreshQueued) {
-      state.fullRefreshQueued = false;
-      state.queuedChanges.clear();
-      await this.performFullIndex(workspace);
-      return;
-    }
-
-    if (state.queuedChanges.size === 0) {
+    if (state.queuedChanges.size === 0 && !state.fullRefreshQueued) {
       return;
     }
 
     const queued = Array.from(state.queuedChanges.entries());
     state.queuedChanges.clear();
-    this.store.setWorkspaceWatchState(workspaceId, "indexing", null);
+    const wasFullRefreshQueued = state.fullRefreshQueued;
+    state.fullRefreshQueued = false;
 
     try {
+      if (wasFullRefreshQueued) {
+        await this.performFullIndex(workspace);
+        return;
+      }
+
+      this.store.setWorkspaceWatchState(workspaceId, "indexing", null);
+
       const changedPaths: string[] = [];
       for (const [absolutePath, operation] of queued) {
         const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
@@ -322,7 +329,13 @@ export class Indexer {
           continue;
         }
         changedPaths.push(relativePath);
-        this.indexAbsoluteFile(workspace, absolutePath);
+        const wasPreviouslyIndexed = this.store.getFile(workspaceId, relativePath) !== null;
+        const wasIndexed = this.indexAbsoluteFile(workspace, absolutePath);
+        // If indexAbsoluteFile skipped the file (non-indexable language, secret,
+        // oversized, binary) but it was previously indexed, remove the stale entry.
+        if (!wasIndexed && wasPreviouslyIndexed) {
+          this.store.removeFile(workspaceId, relativePath);
+        }
       }
       const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
       this.resolver.rebuildRelationsForFiles(workspace, changedPaths, tsconfigPaths);
@@ -330,6 +343,15 @@ export class Indexer {
       this.store.setWorkspaceRevision(workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
       this.store.setWorkspaceWatchState(workspaceId, "watching", null);
     } catch (error) {
+      // Restore queued changes so they can be retried on the next flush
+      for (const [filePath, op] of queued) {
+        if (!state.queuedChanges.has(filePath)) {
+          state.queuedChanges.set(filePath, op);
+        }
+      }
+      if (wasFullRefreshQueued) {
+        state.fullRefreshQueued = true;
+      }
       this.store.setWorkspaceWatchState(
         workspaceId,
         "error",

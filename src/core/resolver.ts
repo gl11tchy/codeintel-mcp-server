@@ -158,6 +158,17 @@ export class Resolver {
     this.store.replaceResolvedRelations(workspace.workspaceId, references, calls);
   }
 
+  /**
+   * Scoped relation rebuild: only re-resolves relations for the changed files
+   * and their direct import dependents.
+   *
+   * Known limitation: the resolver also resolves references via `symbolsByName`
+   * when a symbol name is unique across the workspace. Adding or removing a
+   * symbol can therefore invalidate references in files that don't directly
+   * import the changed file. A full rebuild (`rebuildRelations` / the
+   * `codeintel_refresh_workspace --full` tool) is needed to fix stale
+   * unique-name references after symbols are added or removed.
+   */
   rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[], tsconfigPaths?: TsconfigPaths | null): void {
     if (changedFilePaths.length === 0) return;
 
