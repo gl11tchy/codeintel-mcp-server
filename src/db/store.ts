@@ -5,12 +5,14 @@ import Database from "better-sqlite3";
 import { ensureDir, safeJsonParse, sanitizeFtsQuery } from "../core/utils.js";
 import type {
   CodeSymbol,
+  FileMeta,
   ImportBinding,
   IndexedFile,
   RawCall,
   RawReference,
   ResolvedCall,
   ResolvedReference,
+  SupportedLanguage,
   WorkspaceConfig,
   WorkspaceRecord,
 } from "../types.js";
@@ -468,6 +470,21 @@ export class Store {
     transaction();
   }
 
+  getFileMeta(workspaceId: string): FileMeta[] {
+    const rows = this.db
+      .prepare("SELECT workspace_id, file_path, absolute_path, language, size, mtime_ms, hash FROM files WHERE workspace_id = ? ORDER BY file_path ASC")
+      .all(workspaceId) as Array<{workspace_id: string; file_path: string; absolute_path: string; language: string; size: number; mtime_ms: number; hash: string}>;
+    return rows.map(row => ({
+      workspaceId: row.workspace_id,
+      filePath: row.file_path,
+      absolutePath: row.absolute_path,
+      language: row.language as SupportedLanguage,
+      size: row.size,
+      mtimeMs: row.mtime_ms,
+      hash: row.hash,
+    }));
+  }
+
   getFiles(workspaceId: string): IndexedFile[] {
     const rows = this.db
       .prepare("SELECT * FROM files WHERE workspace_id = ? ORDER BY file_path ASC")
@@ -482,9 +499,9 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     }));
   }
@@ -532,9 +549,9 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     };
   }
@@ -743,9 +760,9 @@ export class Store {
             size: row.size,
             mtimeMs: row.mtime_ms,
             hash: row.hash,
-            imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-            references: safeJsonParse<RawReference[]>(row.references_json),
-            calls: safeJsonParse<RawCall[]>(row.calls_json),
+            imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+            references: safeJsonParse<RawReference[]>(row.references_json, []),
+            calls: safeJsonParse<RawCall[]>(row.calls_json, []),
             parseError: row.parse_error,
           }));
         }
@@ -773,9 +790,9 @@ export class Store {
       size: row.size,
       mtimeMs: row.mtime_ms,
       hash: row.hash,
-      imports: safeJsonParse<ImportBinding[]>(row.imports_json),
-      references: safeJsonParse<RawReference[]>(row.references_json),
-      calls: safeJsonParse<RawCall[]>(row.calls_json),
+      imports: safeJsonParse<ImportBinding[]>(row.imports_json, []),
+      references: safeJsonParse<RawReference[]>(row.references_json, []),
+      calls: safeJsonParse<RawCall[]>(row.calls_json, []),
       parseError: row.parse_error,
     }));
   }
@@ -786,7 +803,7 @@ export class Store {
       rootPath: row.root_path,
       displayName: row.display_name,
       followGitignore: row.follow_gitignore === 1,
-      extraExcludeGlobs: safeJsonParse<string[]>(row.extra_exclude_globs_json),
+      extraExcludeGlobs: safeJsonParse<string[]>(row.extra_exclude_globs_json, []),
       indexedAt: row.indexed_at,
       indexedRevision: row.indexed_revision,
       fileCount: row.file_count,

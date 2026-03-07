@@ -177,6 +177,7 @@ export class CodeIntelService {
   readonly dbPath: string;
   readonly enableWatch: boolean;
   private readonly watchStates = new Map<string, WorkspaceWatchState>();
+  private _closed = false;
 
   constructor(options?: { dbPath?: string; enableWatch?: boolean }) {
     const paths = getPaths();
@@ -188,6 +189,10 @@ export class CodeIntelService {
   }
 
   async close(): Promise<void> {
+    if (this._closed) {
+      return;
+    }
+    this._closed = true;
     for (const watchState of this.watchStates.values()) {
       if (watchState.timer) {
         clearTimeout(watchState.timer);
@@ -258,7 +263,7 @@ export class CodeIntelService {
   getFileTree(workspaceId: string, pathPrefix?: string, maxDepth = 4, limit = 200) {
     const workspace = this.requireWorkspace(workspaceId);
     const files = this.store
-      .getFiles(workspaceId)
+      .getFileMeta(workspaceId)
       .filter((file) => (pathPrefix ? file.filePath.startsWith(pathPrefix) : true))
       .slice(0, limit);
     const symbols = this.store.getSymbols(workspaceId);
@@ -602,7 +607,7 @@ export class CodeIntelService {
 
   languageCounts(workspaceId: string): Record<string, number> {
     const counts: Record<string, number> = {};
-    for (const file of this.store.getFiles(workspaceId)) {
+    for (const file of this.store.getFileMeta(workspaceId)) {
       counts[file.language] = (counts[file.language] ?? 0) + 1;
     }
     return counts;
@@ -716,7 +721,7 @@ export class CodeIntelService {
       }),
     );
 
-    const storedFiles = this.store.getFiles(workspace.workspaceId);
+    const storedFiles = this.store.getFileMeta(workspace.workspaceId);
     const changedAbsolutePaths: string[] = [];
     const removedFilePaths: string[] = [];
 

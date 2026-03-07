@@ -32,6 +32,8 @@ export const SECRET_PATTERNS = [
 const LANGUAGE_BY_EXTENSION: Record<string, SupportedLanguage> = {
   ".js": "javascript",
   ".jsx": "javascript",
+  ".mjs": "javascript",
+  ".cjs": "javascript",
   ".ts": "typescript",
   ".tsx": "tsx",
   ".py": "python",
@@ -105,11 +107,15 @@ export function truncate(value: string, maxLength = 200): string {
   return value.length <= maxLength ? value : `${value.slice(0, maxLength - 1)}…`;
 }
 
-export function safeJsonParse<T>(value: string | null): T {
+export function safeJsonParse<T>(value: string | null, fallback: T): T {
   if (!value) {
-    return [] as T;
+    return fallback;
   }
-  return JSON.parse(value) as T;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 export function sanitizeFtsQuery(query: string): string {

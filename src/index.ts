@@ -115,19 +115,13 @@ async function runHttp(service: CodeIntelService, host: string, port: number): P
   });
 
   await new Promise<void>((resolve, reject) => {
-    const listener = app.listen(port, host, (error?: Error) => {
+    app.listen(port, host, (error?: Error) => {
       if (error) {
         reject(error);
         return;
       }
       console.error(`codeintel-mcp-server listening on http://${host}:${port}/mcp`);
       resolve();
-    });
-
-    process.on("SIGINT", async () => {
-      listener.close();
-      await service.close();
-      process.exit(0);
     });
   });
 }

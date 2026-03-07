@@ -591,19 +591,6 @@ function collectPythonReference(
     enclosingSymbolId: currentExecutable?.id ?? null,
   };
 }
-
-function walkTree(
-  node: SyntaxNode,
-  visit: (current: SyntaxNode, ancestors: CodeSymbol[], frame: SymbolFrame) => void,
-  ancestors: CodeSymbol[],
-  frame: SymbolFrame,
-): void {
-  visit(node, ancestors, frame);
-  for (const child of node.namedChildren) {
-    walkTree(child, visit, ancestors, frame);
-  }
-}
-
 function parseJsLike(
   parser: Parser,
   workspaceId: string,

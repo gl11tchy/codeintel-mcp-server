@@ -30,6 +30,16 @@ export interface WorkspaceRecord extends WorkspaceConfig {
   watchError: string | null;
 }
 
+export interface FileMeta {
+  workspaceId: string;
+  filePath: string;
+  absolutePath: string;
+  language: SupportedLanguage;
+  size: number;
+  mtimeMs: number;
+  hash: string;
+}
+
 export interface IndexedFile {
   workspaceId: string;
   filePath: string;
