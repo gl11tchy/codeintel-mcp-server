@@ -542,5 +542,171 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
     },
   );
 
+  // ---------------------------------------------------------------------------
+  // Resources
+  // ---------------------------------------------------------------------------
+
+  // Static resource: list all indexed workspaces
+  server.registerResource(
+    "workspaces",
+    "codeintel://workspaces",
+    {
+      description: "List all indexed workspaces with summary metadata and language counts.",
+      mimeType: "application/json",
+    },
+    async (uri) => ({
+      contents: [
+        {
+          uri: uri.href,
+          mimeType: "application/json",
+          text: JSON.stringify(service.listWorkspaces(), null, 2),
+        },
+      ],
+    }),
+  );
+
+  // Resource template: workspace detail
+  server.registerResource(
+    "workspace_detail",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}", {
+      list: async () => ({
+        resources: service.listWorkspaces().map((ws) => ({
+          uri: `codeintel://workspace/${ws.workspace_id}`,
+          name: ws.display_name,
+          description: `Workspace ${ws.display_name} (${ws.file_count} files, ${ws.symbol_count} symbols)`,
+          mimeType: "application/json",
+        })),
+      }),
+    }),
+    {
+      description: "Workspace summary including language counts.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const status = service.getWorkspaceStatus(workspaceId);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(status, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: file listing for a workspace
+  server.registerResource(
+    "workspace_files",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/files", {
+      list: async () => ({
+        resources: service.listWorkspaces().map((ws) => ({
+          uri: `codeintel://workspace/${ws.workspace_id}/files`,
+          name: `${ws.display_name} files`,
+          description: `File listing for workspace ${ws.display_name}`,
+          mimeType: "application/json",
+        })),
+      }),
+    }),
+    {
+      description: "JSON array of indexed file paths with language and symbol count.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const files = service.store.getFileMeta(workspaceId);
+      const symbols = service.store.getSymbols(workspaceId);
+      const symbolCountByFile = new Map<string, number>();
+      for (const symbol of symbols) {
+        symbolCountByFile.set(symbol.filePath, (symbolCountByFile.get(symbol.filePath) ?? 0) + 1);
+      }
+      const items = files.map((file) => ({
+        file_path: file.filePath,
+        language: file.language,
+        size: file.size,
+        symbol_count: symbolCountByFile.get(file.filePath) ?? 0,
+      }));
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(items, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: file content + outline
+  // Uses {+filePath} (RFC 6570 reserved expansion) so slashes in file paths are matched.
+  server.registerResource(
+    "file_content",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/file/{+filePath}", {
+      list: undefined,
+    }),
+    {
+      description: "File source content and symbol outline for a single indexed file.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const filePath = variables.filePath as string;
+      const file = service.store.getFile(workspaceId, filePath);
+      if (!file) {
+        throw new Error(`File not found: ${filePath} in workspace ${workspaceId}`);
+      }
+      const outline = service.getFileOutline(workspaceId, filePath);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(
+              {
+                file_path: file.filePath,
+                language: file.language,
+                size: file.size,
+                content: file.text,
+                outline,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  // Resource template: symbol detail
+  // Uses {+symbolId} because symbol IDs contain path separators and special characters (e.g. path::name#kind).
+  server.registerResource(
+    "symbol_detail",
+    new ResourceTemplate("codeintel://workspace/{workspaceId}/symbol/{+symbolId}", {
+      list: undefined,
+    }),
+    {
+      description: "Symbol body and metadata for a single indexed symbol.",
+      mimeType: "application/json",
+    },
+    async (uri, variables) => {
+      const workspaceId = variables.workspaceId as string;
+      const symbolId = variables.symbolId as string;
+      const result = service.getSymbol(workspaceId, symbolId);
+      return {
+        contents: [
+          {
+            uri: uri.href,
+            mimeType: "application/json",
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    },
+  );
+
   return server;
 }
