@@ -9,6 +9,7 @@ import type { Store } from "../db/store.js";
 import { parseFile } from "../parser/extract.js";
 import type { IndexedFile, WorkspaceConfig, WorkspaceRecord } from "../types.js";
 import type { Resolver } from "./resolver.js";
+import { readTsconfigPaths } from "./tsconfig.js";
 import {
   DEFAULT_EXCLUDE_GLOBS,
   MAX_FILE_BYTES,
@@ -63,7 +64,8 @@ export class Indexer {
       for (const absolutePath of this.collectWorkspaceFiles(config)) {
         this.indexAbsoluteFile(config, absolutePath);
       }
-      this.resolver.rebuildRelations(config);
+      const tsconfigPaths = readTsconfigPaths(config.rootPath);
+      this.resolver.rebuildRelations(config, tsconfigPaths);
       this.store.updateWorkspaceCounts(config.workspaceId);
       this.store.setWorkspaceRevision(config.workspaceId, startedAt, revision);
       this.store.setWorkspaceWatchState(config.workspaceId, this.enableWatch ? "watching" : "indexed", null);
@@ -95,7 +97,8 @@ export class Indexer {
         this.store.removeFile(workspace.workspaceId, filePath);
       }
       const allChangedPaths = [...changedRelPaths, ...dirty.removedFilePaths];
-      this.resolver.rebuildRelationsForFiles(workspace, allChangedPaths);
+      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
+      this.resolver.rebuildRelationsForFiles(workspace, allChangedPaths, tsconfigPaths);
       this.store.updateWorkspaceCounts(workspace.workspaceId);
       this.store.setWorkspaceRevision(workspace.workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
       this.store.setWorkspaceWatchState(workspace.workspaceId, this.enableWatch ? "watching" : "indexed", null);
@@ -321,7 +324,8 @@ export class Indexer {
         changedPaths.push(relativePath);
         this.indexAbsoluteFile(workspace, absolutePath);
       }
-      this.resolver.rebuildRelationsForFiles(workspace, changedPaths);
+      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
+      this.resolver.rebuildRelationsForFiles(workspace, changedPaths, tsconfigPaths);
       this.store.updateWorkspaceCounts(workspaceId);
       this.store.setWorkspaceRevision(workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
       this.store.setWorkspaceWatchState(workspaceId, "watching", null);

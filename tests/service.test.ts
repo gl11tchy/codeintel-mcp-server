@@ -119,6 +119,73 @@ describe("CodeIntelService", () => {
     expect(callees.items.some((item) => item.callee_symbol?.qualified_name === "Greeter.format")).toBe(true);
   });
 
+  it("resolves tsconfig path aliases (@/* and custom prefixes)", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-alias");
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    expect(indexed.workspace.file_count).toBe(3);
+
+    // getUserById is defined in src/lib/helpers.ts
+    const helpersSearch = service.searchSymbols({
+      workspaceId: indexed.workspace.workspace_id,
+      query: "getUserById",
+      limit: 10,
+      offset: 0,
+    });
+    const getUserByIdSymbol = helpersSearch.items.find((item) => item.name === "getUserById");
+    expect(getUserByIdSymbol).toBeDefined();
+
+    // UserCard.ts imports from "@/lib/helpers" — that should resolve via tsconfig paths
+    const refs = service.findReferences(indexed.workspace.workspace_id, getUserByIdSymbol!.symbol_id, true, 20, 0);
+    const refFiles = refs.items.map((item) => item.file_path);
+    expect(refFiles).toContain("src/lib/helpers.ts"); // declaration
+    expect(refFiles).toContain("src/components/UserCard.ts"); // import via @/ alias
+
+    // renderUserCard is defined in src/components/UserCard.ts
+    const renderSearch = service.searchSymbols({
+      workspaceId: indexed.workspace.workspace_id,
+      query: "renderUserCard",
+      limit: 10,
+      offset: 0,
+    });
+    const renderSymbol = renderSearch.items.find((item) => item.name === "renderUserCard");
+    expect(renderSymbol).toBeDefined();
+
+    // src/index.ts imports from "~components/UserCard" — that should also resolve
+    const renderRefs = service.findReferences(indexed.workspace.workspace_id, renderSymbol!.symbol_id, true, 20, 0);
+    const renderRefFiles = renderRefs.items.map((item) => item.file_path);
+    expect(renderRefFiles).toContain("src/components/UserCard.ts"); // declaration
+    expect(renderRefFiles).toContain("src/index.ts"); // import via ~components/ alias
+  });
+
+  it("FTS5 search finds camelCase symbols by substring tokens", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-alias");
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+
+    // Searching "get" should find "getUserById" thanks to camelCase splitting
+    const getSearch = service.searchSymbols({
+      workspaceId: indexed.workspace.workspace_id,
+      query: "get",
+      limit: 10,
+      offset: 0,
+    });
+    expect(getSearch.items.some((item) => item.name === "getUserById")).toBe(true);
+
+    // Searching "User" should find symbols with "User" in camelCase
+    const userSearch = service.searchSymbols({
+      workspaceId: indexed.workspace.workspace_id,
+      query: "User",
+      limit: 10,
+      offset: 0,
+    });
+    expect(userSearch.items.some((item) => item.name === "getUserById")).toBe(true);
+    expect(userSearch.items.some((item) => item.name === "formatUserName")).toBe(true);
+    expect(userSearch.items.some((item) => item.name === "renderUserCard")).toBe(true);
+  });
+
   it("refreshes an indexed workspace after a file change", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-lib");

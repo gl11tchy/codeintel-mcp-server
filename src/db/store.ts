@@ -2,7 +2,7 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
-import { ensureDir, safeJsonParse, sanitizeFtsQuery } from "../core/utils.js";
+import { ensureDir, safeJsonParse, sanitizeFtsQuery, splitIdentifier } from "../core/utils.js";
 import type {
   CodeSymbol,
   FileMeta,
@@ -445,12 +445,14 @@ export class Store {
 
       for (const symbol of symbols) {
         insertSymbol.run(symbol);
+        const searchName = `${symbol.name} ${splitIdentifier(symbol.name)}`;
+        const searchQualified = `${symbol.qualifiedName} ${splitIdentifier(symbol.qualifiedName)}`;
         insertSymbolFts.run(
           symbol.workspaceId,
           symbol.filePath,
           symbol.id,
-          symbol.name,
-          symbol.qualifiedName,
+          searchName,
+          searchQualified,
           symbol.signature,
           symbol.summary,
         );

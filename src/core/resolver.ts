@@ -10,6 +10,8 @@ import type {
   ResolvedReference,
   WorkspaceConfig,
 } from "../types.js";
+import type { TsconfigPaths } from "./tsconfig.js";
+import { resolveAliasedImport } from "./tsconfig.js";
 import { resolveJsImport, resolvePythonModule } from "./utils.js";
 
 export interface CandidateBinding {
@@ -62,11 +64,12 @@ export class Resolver {
     maps: LookupMaps,
     referenceDedup: Set<string>,
     callDedup: Set<string>,
+    tsconfigPaths?: TsconfigPaths | null,
   ): { references: ResolvedReference[]; calls: ResolvedCall[] } {
     const references: ResolvedReference[] = [];
     const calls: ResolvedCall[] = [];
 
-    const bindings = this.resolveBindings(workspace, file, maps.knownFiles, maps.filesByPath, maps.symbolsByFileAndName);
+    const bindings = this.resolveBindings(workspace, file, maps.knownFiles, maps.filesByPath, maps.symbolsByFileAndName, tsconfigPaths);
     for (const binding of bindings.values()) {
       if (!binding.targetSymbolId) {
         continue;
@@ -136,7 +139,7 @@ export class Resolver {
     return { references, calls };
   }
 
-  rebuildRelations(workspace: WorkspaceConfig): void {
+  rebuildRelations(workspace: WorkspaceConfig, tsconfigPaths?: TsconfigPaths | null): void {
     const files = this.store.getFiles(workspace.workspaceId);
     const symbols = this.store.getSymbols(workspace.workspaceId);
     const maps = this.buildLookupMaps(files, symbols);
@@ -147,7 +150,7 @@ export class Resolver {
     const callDedup = new Set<string>();
 
     for (const file of files) {
-      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
+      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup, tsconfigPaths);
       references.push(...result.references);
       calls.push(...result.calls);
     }
@@ -155,7 +158,7 @@ export class Resolver {
     this.store.replaceResolvedRelations(workspace.workspaceId, references, calls);
   }
 
-  rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[]): void {
+  rebuildRelationsForFiles(workspace: WorkspaceConfig, changedFilePaths: string[], tsconfigPaths?: TsconfigPaths | null): void {
     if (changedFilePaths.length === 0) return;
 
     const dependentPaths = this.store.getFilesThatImportFrom(workspace.workspaceId, changedFilePaths);
@@ -176,7 +179,7 @@ export class Resolver {
     const callDedup = new Set<string>();
 
     for (const file of affectedFiles) {
-      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup);
+      const result = this.resolveFileRelations(workspace, file, maps, referenceDedup, callDedup, tsconfigPaths);
       references.push(...result.references);
       calls.push(...result.calls);
     }
@@ -190,14 +193,20 @@ export class Resolver {
     knownFiles: Set<string>,
     filesByPath: Map<string, IndexedFile>,
     symbolsByFileAndName: Map<string, Map<string, CodeSymbol[]>>,
+    tsconfigPaths?: TsconfigPaths | null,
   ): Map<string, CandidateBinding> {
     const bindings = new Map<string, CandidateBinding>();
 
     for (const binding of file.imports) {
-      const targetFilePath =
+      let targetFilePath =
         file.language === "python"
           ? resolvePythonModule(file.filePath, binding.moduleSpecifier, knownFiles)
           : resolveJsImport(workspace.rootPath, file.filePath, binding.moduleSpecifier, knownFiles);
+
+      // Fall back to tsconfig paths alias resolution for JS/TS imports
+      if (!targetFilePath && file.language !== "python" && tsconfigPaths) {
+        targetFilePath = resolveAliasedImport(workspace.rootPath, tsconfigPaths, binding.moduleSpecifier, knownFiles);
+      }
 
       let targetSymbolId: string | null = null;
       let confidence: Confidence = "low";
