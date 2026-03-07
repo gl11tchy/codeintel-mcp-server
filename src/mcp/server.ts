@@ -1,9 +1,23 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 
 import { estimateTokens } from "../core/utils.js";
 import { CodeIntelService } from "../core/service.js";
 import type { FileTreeNode, MetaEnvelope, OutlineNode, ResponseFormat } from "../types.js";
+import {
+  indexWorkspaceOutputSchema,
+  listWorkspacesOutputSchema,
+  getWorkspaceStatusOutputSchema,
+  refreshWorkspaceOutputSchema,
+  getFileTreeOutputSchema,
+  getFileOutlineOutputSchema,
+  searchSymbolsOutputSchema,
+  getSymbolOutputSchema,
+  searchTextOutputSchema,
+  findReferencesOutputSchema,
+  findCallersOutputSchema,
+  findCalleesOutputSchema,
+} from "./schemas.js";
 
 const responseFormatSchema = z
   .enum(["markdown", "json"])
@@ -77,7 +91,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       name: "codeintel-mcp-server",
       version: "0.1.0",
     },
-    { capabilities: { logging: {} } },
+    { capabilities: { logging: {}, resources: {} } },
   );
 
   server.registerTool(
@@ -91,6 +105,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         follow_gitignore: z.boolean().default(true).describe("Whether to respect the root .gitignore file during indexing."),
         response_format: responseFormatSchema,
       },
+      outputSchema: indexWorkspaceOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -122,6 +137,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
       inputSchema: {
         response_format: responseFormatSchema,
       },
+      outputSchema: listWorkspacesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -155,6 +171,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         workspace_id: workspaceIdSchema,
         response_format: responseFormatSchema.default("json"),
       },
+      outputSchema: getWorkspaceStatusOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -190,6 +207,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         full: z.boolean().default(false).describe("Set true to rebuild the workspace index from scratch."),
         response_format: responseFormatSchema,
       },
+      outputSchema: refreshWorkspaceOutputSchema,
       annotations: {
         readOnlyHint: false,
         destructiveHint: false,
@@ -221,6 +239,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(1000).default(200).describe("Maximum number of indexed files to include."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getFileTreeOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -250,6 +269,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         file_path: z.string().min(1).describe("Relative path to a file within the indexed workspace."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getFileOutlineOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -284,6 +304,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: searchSymbolsOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -331,6 +352,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         include_body: z.boolean().default(true).describe("Whether to include the exact symbol body."),
         response_format: responseFormatSchema,
       },
+      outputSchema: getSymbolOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -374,6 +396,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: searchTextOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -417,6 +440,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         offset: offsetSchema,
         response_format: responseFormatSchema,
       },
+      outputSchema: findReferencesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -456,6 +480,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(100).default(25).describe("Maximum number of caller edges to return."),
         response_format: responseFormatSchema,
       },
+      outputSchema: findCallersOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
@@ -492,6 +517,7 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
         limit: z.number().int().min(1).max(100).default(25).describe("Maximum number of callee edges to return."),
         response_format: responseFormatSchema,
       },
+      outputSchema: findCalleesOutputSchema,
       annotations: {
         readOnlyHint: true,
         destructiveHint: false,
