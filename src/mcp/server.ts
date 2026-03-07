@@ -17,6 +17,7 @@ import {
   findReferencesOutputSchema,
   findCallersOutputSchema,
   findCalleesOutputSchema,
+  renameSymbolOutputSchema,
 } from "./schemas.js";
 
 const responseFormatSchema = z
@@ -538,6 +539,53 @@ export function createCodeIntelMcpServer(service: CodeIntelService): McpServer {
                   `- depth ${item.depth}: ${item.caller_symbol?.qualified_name ?? "unknown"} -> ${item.callee_symbol?.qualified_name ?? item.callee_name}\n  ${item.file_path}:${item.line}:${item.column}\n  ${item.context}\n  ${item.reason}`,
               )
               .join("\n");
+      return makeResult(response_format, { ...result, _meta: meta }, markdown);
+    },
+  );
+
+  server.registerTool(
+    "codeintel_rename_symbol",
+    {
+      title: "Rename Symbol",
+      description:
+        "Rename a symbol and update all resolved references across the workspace. Defaults to dry-run mode.",
+      inputSchema: {
+        workspace_id: workspaceIdSchema,
+        symbol_id: z.string().min(3).describe("Stable symbol id to rename."),
+        new_name: z.string().min(1).describe("New name for the symbol."),
+        dry_run: z.boolean().default(true).describe("If true, return preview of changes without applying."),
+        response_format: responseFormatSchema,
+      },
+      outputSchema: renameSymbolOutputSchema,
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspace_id, symbol_id, new_name, dry_run, response_format }) => {
+      const startedAt = performance.now();
+      const result = service.renameSymbol(workspace_id, symbol_id, new_name, dry_run);
+      const meta = service.metaForWorkspace(workspace_id, startedAt);
+
+      const markdown = [
+        `${dry_run ? "Preview" : "Applied"} rename: \`${result.edits[0]?.oldText}\` → \`${new_name}\``,
+        "",
+        `- Files affected: ${result.filesAffected}`,
+        `- References updated: ${result.referencesUpdated}`,
+        result.warnings.length > 0
+          ? `\nWarnings:\n${result.warnings.map((w) => `- ${w}`).join("\n")}`
+          : "",
+        "",
+        "Changes:",
+        ...result.edits.map(
+          (e) => `- ${e.filePath}:${e.line}:${e.column} \`${e.oldText}\` → \`${e.newText}\``,
+        ),
+      ]
+        .filter(Boolean)
+        .join("\n");
+
       return makeResult(response_format, { ...result, _meta: meta }, markdown);
     },
   );

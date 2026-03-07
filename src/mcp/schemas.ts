@@ -220,3 +220,20 @@ export const findCalleesOutputSchema = {
   ),
   _meta: metaSchema,
 } as const;
+
+export const renameSymbolOutputSchema = {
+  edits: z.array(
+    z.object({
+      filePath: z.string(),
+      line: z.number(),
+      column: z.number(),
+      oldText: z.string(),
+      newText: z.string(),
+    }),
+  ),
+  filesAffected: z.number(),
+  referencesUpdated: z.number(),
+  warnings: z.array(z.string()),
+  applied: z.boolean(),
+  _meta: metaSchema,
+} as const;

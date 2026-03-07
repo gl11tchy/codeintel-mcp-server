@@ -186,6 +186,60 @@ describe("CodeIntelService", () => {
     expect(userSearch.items.some((item) => item.name === "renderUserCard")).toBe(true);
   });
 
+  it("renames a symbol in dry-run mode and then applies the rename", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    // Find the `add` symbol
+    const addSymbol = service.searchSymbols({
+      workspaceId,
+      query: "add",
+      limit: 10,
+      offset: 0,
+    }).items.find((item) => item.name === "add");
+    expect(addSymbol).toBeDefined();
+
+    // Dry-run rename to `addNumbers`
+    const dryResult = service.renameSymbol(workspaceId, addSymbol!.symbol_id, "addNumbers", true);
+    expect(dryResult.applied).toBe(false);
+    expect(dryResult.filesAffected).toBeGreaterThanOrEqual(2);
+    expect(dryResult.edits.some((e) => e.filePath === "src/math.ts")).toBe(true);
+    expect(dryResult.edits.some((e) => e.filePath === "src/index.ts")).toBe(true);
+    expect(dryResult.edits.every((e) => e.oldText === "add" && e.newText === "addNumbers")).toBe(true);
+
+    // Verify files are unchanged after dry run
+    const mathContent = fs.readFileSync(path.join(workspacePath, "src/math.ts"), "utf8");
+    expect(mathContent).toContain("function add(");
+
+    // Apply the rename
+    const applyResult = service.renameSymbol(workspaceId, addSymbol!.symbol_id, "addNumbers", false);
+    expect(applyResult.applied).toBe(true);
+    expect(applyResult.filesAffected).toBeGreaterThanOrEqual(2);
+
+    // Verify file contents actually changed
+    const mathContentAfter = fs.readFileSync(path.join(workspacePath, "src/math.ts"), "utf8");
+    expect(mathContentAfter).toContain("function addNumbers(");
+    expect(mathContentAfter).not.toContain("function add(");
+
+    const indexContentAfter = fs.readFileSync(path.join(workspacePath, "src/index.ts"), "utf8");
+    expect(indexContentAfter).toContain("addNumbers");
+
+    // Verify re-indexing finds the symbol under the new name
+    const newSearch = service.searchSymbols({
+      workspaceId,
+      query: "addNumbers",
+      limit: 10,
+      offset: 0,
+    });
+    expect(newSearch.items.some((item) => item.name === "addNumbers")).toBe(true);
+    expect(
+      service.searchSymbols({ workspaceId, query: "add", limit: 10, offset: 0 })
+        .items.every((item) => item.name !== "add"),
+    ).toBe(true);
+  });
+
   it("refreshes an indexed workspace after a file change", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-lib");

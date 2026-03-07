@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 
 import { minimatch } from "minimatch";
@@ -19,6 +20,7 @@ import type {
   WorkspaceSummary,
 } from "../types.js";
 import { Indexer } from "./indexer.js";
+import { Refactor, type RenameResult } from "./refactor.js";
 import { Resolver } from "./resolver.js";
 import {
   ensureDir,
@@ -135,6 +137,7 @@ export class CodeIntelService {
   readonly enableWatch: boolean;
   private readonly indexer: Indexer;
   private readonly resolver: Resolver;
+  private readonly refactor: Refactor;
   private _closed = false;
 
   constructor(options?: { dbPath?: string; enableWatch?: boolean }) {
@@ -145,6 +148,7 @@ export class CodeIntelService {
     this.enableWatch = options?.enableWatch ?? true;
     this.store = new Store(this.dbPath);
     this.resolver = new Resolver(this.store);
+    this.refactor = new Refactor(this.store);
     this.indexer = new Indexer(
       this.store,
       this.enableWatch,
@@ -581,6 +585,25 @@ export class CodeIntelService {
       watch_status: workspace?.watchStatus,
       ...extra,
     };
+  }
+
+  renameSymbol(workspaceId: string, symbolId: string, newName: string, dryRun = true): RenameResult {
+    const workspace = this.requireWorkspace(workspaceId);
+    const result = this.refactor.renameSymbol(workspaceId, symbolId, newName, dryRun, workspace.rootPath);
+
+    if (result.applied) {
+      const affectedPaths = [...new Set(result.edits.map((e) => e.filePath))];
+      for (const filePath of affectedPaths) {
+        const absolutePath = path.join(workspace.rootPath, filePath);
+        if (fs.existsSync(absolutePath)) {
+          this.indexer.indexAbsoluteFile(workspace, absolutePath);
+        }
+      }
+      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths);
+      this.store.updateWorkspaceCounts(workspaceId);
+    }
+
+    return result;
   }
 
   private requireWorkspace(workspaceId: string): WorkspaceRecord {
