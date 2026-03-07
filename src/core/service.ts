@@ -593,16 +593,7 @@ export class CodeIntelService {
     const result = this.refactor.renameSymbol(workspaceId, symbolId, newName, dryRun, workspace.rootPath);
 
     if (result.applied) {
-      const affectedPaths = [...new Set(result.edits.map((e) => e.filePath))];
-      for (const filePath of affectedPaths) {
-        const absolutePath = path.join(workspace.rootPath, filePath);
-        if (fs.existsSync(absolutePath)) {
-          this.indexer.indexAbsoluteFile(workspace, absolutePath);
-        }
-      }
-      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
-      this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
-      this.store.updateWorkspaceCounts(workspaceId);
+      this.reindexAfterRefactor(workspace, result.edits.map((e) => e.filePath));
     }
 
     return result;
@@ -613,7 +604,15 @@ export class CodeIntelService {
     const result = this.refactor.moveSymbol(workspaceId, symbolId, targetFilePath, dryRun, workspace.rootPath);
 
     if (result.applied) {
-      const affectedPaths = [...new Set(result.edits.map((e) => e.filePath))];
+      this.reindexAfterRefactor(workspace, result.edits.map((e) => e.filePath));
+    }
+
+    return result;
+  }
+
+  private reindexAfterRefactor(workspace: WorkspaceRecord, editedFilePaths: string[]): void {
+    const affectedPaths = [...new Set(editedFilePaths)];
+    try {
       for (const filePath of affectedPaths) {
         const absolutePath = path.join(workspace.rootPath, filePath);
         if (fs.existsSync(absolutePath)) {
@@ -622,10 +621,12 @@ export class CodeIntelService {
       }
       const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
       this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
-      this.store.updateWorkspaceCounts(workspaceId);
+      this.store.updateWorkspaceCounts(workspace.workspaceId);
+    } catch {
+      // Edits were already applied to disk; mark workspace stale so the next
+      // refresh picks up the divergence rather than silently staying out of sync.
+      this.store.setWorkspaceWatchState(workspace.workspaceId, "stale", "Post-refactor reindex failed; run codeintel_refresh_workspace to recover.");
     }
-
-    return result;
   }
 
   private requireWorkspace(workspaceId: string): WorkspaceRecord {

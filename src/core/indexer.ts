@@ -91,7 +91,12 @@ export class Indexer {
         (absPath) => relativeWorkspacePath(workspace.rootPath, absPath),
       );
       for (const absolutePath of dirty.changedAbsolutePaths) {
-        this.indexAbsoluteFile(workspace, absolutePath);
+        const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
+        const wasPreviouslyIndexed = this.store.getFile(workspace.workspaceId, relativePath) !== null;
+        const wasIndexed = this.indexAbsoluteFile(workspace, absolutePath);
+        if (!wasIndexed && wasPreviouslyIndexed) {
+          this.store.removeFile(workspace.workspaceId, relativePath);
+        }
       }
       for (const filePath of dirty.removedFilePaths) {
         this.store.removeFile(workspace.workspaceId, filePath);
@@ -316,7 +321,7 @@ export class Indexer {
       const changedPaths: string[] = [];
       for (const [absolutePath, operation] of queued) {
         const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
-        if (relativePath === ".git/HEAD") {
+        if (relativePath === ".git/HEAD" || relativePath === "tsconfig.json" || relativePath === "jsconfig.json") {
           await this.performFullIndex(workspace);
           return;
         }

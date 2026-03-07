@@ -83,7 +83,9 @@ export class Resolver {
         workspaceId: workspace.workspaceId,
         filePath: file.filePath,
         targetSymbolId: binding.targetSymbolId,
-        referencedName: binding.binding.importedName,
+        // Use localName for default imports (that's the identifier in the code),
+        // importedName for named imports (the original name before `as` alias)
+        referencedName: binding.binding.kind === "default" ? binding.binding.localName : binding.binding.importedName,
         qualifier: null,
         enclosingSymbolId: null,
         line: binding.binding.line,

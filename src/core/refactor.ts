@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import type { Store } from "../db/store.js";
+import { languageFromFilePath } from "./utils.js";
 
 export interface RenameEdit {
   filePath: string;
@@ -50,8 +51,11 @@ export class Refactor {
       throw new Error(`Symbol not found: ${symbolId}`);
     }
 
-    if (!/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(newName)) {
-      throw new Error(`Invalid identifier: ${newName}`);
+    const identifierPattern = symbol.language === "python"
+      ? /^[a-zA-Z_][a-zA-Z0-9_]*$/
+      : /^[a-zA-Z_$][a-zA-Z0-9_$]*$/;
+    if (!identifierPattern.test(newName)) {
+      throw new Error(`Invalid identifier for ${symbol.language}: ${newName}`);
     }
 
     if (newName === symbol.name) {
@@ -112,11 +116,17 @@ export class Refactor {
     dryRun: boolean,
     workspaceRoot: string,
   ): MoveResult {
-    // Validate that the target path stays within the workspace (prevent path traversal)
+    // Canonicalize and validate the target path
     const normalizedRoot = path.resolve(workspaceRoot);
     const targetAbsolutePath = path.resolve(workspaceRoot, targetFilePath);
     if (!targetAbsolutePath.startsWith(normalizedRoot + path.sep) && targetAbsolutePath !== normalizedRoot) {
       throw new Error(`Target file must stay within the workspace: ${targetFilePath}`);
+    }
+    // Use the canonical workspace-relative path everywhere
+    const canonicalTarget = path.relative(normalizedRoot, targetAbsolutePath).split(path.sep).join("/");
+
+    if (!languageFromFilePath(canonicalTarget)) {
+      throw new Error(`Target file has no indexable extension: ${canonicalTarget}`);
     }
 
     const symbol = this.store.getSymbol(symbolId);
@@ -125,8 +135,8 @@ export class Refactor {
     }
 
     const sourceFilePath = symbol.filePath;
-    if (sourceFilePath === targetFilePath) {
-      throw new Error(`Symbol is already in ${targetFilePath}`);
+    if (sourceFilePath === canonicalTarget) {
+      throw new Error(`Symbol is already in ${canonicalTarget}`);
     }
 
     const edits: MoveEdit[] = [];
@@ -162,7 +172,7 @@ export class Refactor {
 
     // Edit 2: Append the symbol to the target file
     edits.push({
-      filePath: targetFilePath,
+      filePath: canonicalTarget,
       action: "insert_lines",
       line: -1, // -1 means append
       newText: symbolText,
@@ -195,7 +205,7 @@ export class Refactor {
 
       // Compute the new relative import path from the importing file to the target file
       const importingDir = path.dirname(ref.filePath);
-      let newRelativePath = path.posix.relative(importingDir, targetFilePath);
+      let newRelativePath = path.posix.relative(importingDir, canonicalTarget);
       // Strip extension for TS-style imports
       newRelativePath = newRelativePath.replace(/\.(ts|tsx|js|jsx)$/, "");
       if (!newRelativePath.startsWith(".")) {
@@ -368,9 +378,14 @@ export class Refactor {
         const line = lines[lineIndex];
         const colIndex = edit.column - 1;
 
-        // Search near the expected column for the old text
-        const pos = line.indexOf(edit.oldText, Math.max(0, colIndex - 5));
-        if (pos === -1) continue;
+        // Try exact column first, then fall back to a bounded search
+        let pos: number;
+        if (colIndex >= 0 && line.slice(colIndex, colIndex + edit.oldText.length) === edit.oldText) {
+          pos = colIndex;
+        } else {
+          pos = line.indexOf(edit.oldText, Math.max(0, colIndex - 5));
+          if (pos === -1) continue;
+        }
 
         lines[lineIndex] =
           line.slice(0, pos) + edit.newText + line.slice(pos + edit.oldText.length);

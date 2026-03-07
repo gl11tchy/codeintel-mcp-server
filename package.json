@@ -41,7 +41,7 @@
     "lint": "eslint src/"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=20.19.0"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.27.1",
