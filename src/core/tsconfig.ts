@@ -5,13 +5,18 @@ import path from "node:path";
 const require = createRequire(import.meta.url);
 
 export interface TsconfigPaths {
-  baseUrl: string;
+  baseUrl: string | null;
   paths: Record<string, string[]>;
 }
 
 export interface TsconfigInfo {
   paths: TsconfigPaths | null;
   configFiles: string[];
+}
+
+interface NormalizedCompilerOptions {
+  baseUrl?: string;
+  paths?: Record<string, string[]>;
 }
 
 function parseTsconfigFile(configPath: string): Record<string, unknown> | null {
@@ -63,41 +68,119 @@ function resolveExtendsPath(configPath: string, extendsValue: string): string {
 function resolveExtendsChain(
   configPath: string,
   maxDepth = 5,
-): { compilerOptions: Record<string, unknown>; configFiles: string[] } {
-  let mergedCompilerOptions: Record<string, unknown> = {};
-  const configFiles: string[] = [];
-
-  let currentPath = path.resolve(configPath);
-  for (let depth = 0; depth < maxDepth; depth++) {
-    if (configFiles.includes(currentPath)) {
-      break;
-    }
-    configFiles.push(currentPath);
-
-    const config = parseTsconfigFile(currentPath);
-    if (!config) break;
-
-    const currentOptions = (config.compilerOptions ?? {}) as Record<string, unknown>;
-    // Child overrides base: spread current (base) first, then accumulated child on top
-    mergedCompilerOptions = { ...currentOptions, ...mergedCompilerOptions };
-
-    const extendsValue = config.extends;
-    if (typeof extendsValue !== "string") break;
-
-    const nextPath = resolveExtendsPath(currentPath, extendsValue);
-    if (!fs.existsSync(nextPath)) {
-      if (!configFiles.includes(nextPath)) {
-        configFiles.push(nextPath);
-      }
-      break;
-    }
-    currentPath = nextPath;
+  visited = new Set<string>(),
+  depth = 0,
+): { compilerOptions: NormalizedCompilerOptions; configFiles: string[] } {
+  const currentPath = path.resolve(configPath);
+  if (depth >= maxDepth || visited.has(currentPath)) {
+    return {
+      compilerOptions: {},
+      configFiles: [currentPath],
+    };
   }
 
+  const nextVisited = new Set(visited);
+  nextVisited.add(currentPath);
+  const configFiles = [currentPath];
+  const config = parseTsconfigFile(currentPath);
+  if (!config) {
+    return {
+      compilerOptions: {},
+      configFiles,
+    };
+  }
+
+  let mergedCompilerOptions: NormalizedCompilerOptions = {};
+  for (const entry of normalizeExtendsEntries(config.extends)) {
+    const nextPath = resolveExtendsPath(currentPath, entry);
+    if (!configFiles.includes(nextPath)) {
+      configFiles.push(nextPath);
+    }
+    if (!fs.existsSync(nextPath)) {
+      continue;
+    }
+
+    const extended = resolveExtendsChain(nextPath, maxDepth, nextVisited, depth + 1);
+    mergedCompilerOptions = mergeCompilerOptions(mergedCompilerOptions, extended.compilerOptions);
+    for (const filePath of extended.configFiles) {
+      if (!configFiles.includes(filePath)) {
+        configFiles.push(filePath);
+      }
+    }
+  }
+
+  const declaredOptions = normalizeDeclaredCompilerOptions(
+    currentPath,
+    config.compilerOptions,
+    mergedCompilerOptions,
+  );
+
   return {
-    compilerOptions: mergedCompilerOptions,
+    compilerOptions: mergeCompilerOptions(mergedCompilerOptions, declaredOptions),
     configFiles,
   };
+}
+
+function normalizeExtendsEntries(extendsValue: unknown): string[] {
+  if (typeof extendsValue === "string") {
+    return [extendsValue];
+  }
+  if (!Array.isArray(extendsValue)) {
+    return [];
+  }
+  return extendsValue.filter((entry): entry is string => typeof entry === "string");
+}
+
+function mergeCompilerOptions(
+  base: NormalizedCompilerOptions,
+  override: NormalizedCompilerOptions,
+): NormalizedCompilerOptions {
+  const merged: NormalizedCompilerOptions = { ...base };
+  if (override.baseUrl !== undefined) {
+    merged.baseUrl = override.baseUrl;
+  }
+  if (override.paths !== undefined) {
+    merged.paths = override.paths;
+  }
+  return merged;
+}
+
+function normalizeDeclaredCompilerOptions(
+  configPath: string,
+  compilerOptionsValue: unknown,
+  inherited: NormalizedCompilerOptions,
+): NormalizedCompilerOptions {
+  if (!compilerOptionsValue || typeof compilerOptionsValue !== "object" || Array.isArray(compilerOptionsValue)) {
+    return {};
+  }
+
+  const compilerOptions = compilerOptionsValue as Record<string, unknown>;
+  const currentDir = path.dirname(configPath);
+  const normalized: NormalizedCompilerOptions = {};
+  const inheritedBaseUrl = inherited.baseUrl;
+  const effectiveBaseUrl = typeof compilerOptions.baseUrl === "string"
+    ? path.resolve(currentDir, compilerOptions.baseUrl)
+    : inheritedBaseUrl;
+
+  if (typeof compilerOptions.baseUrl === "string") {
+    normalized.baseUrl = effectiveBaseUrl;
+  }
+
+  if (compilerOptions.paths && typeof compilerOptions.paths === "object" && !Array.isArray(compilerOptions.paths)) {
+    const resolutionBase = effectiveBaseUrl ?? currentDir;
+    const normalizedPaths: Record<string, string[]> = {};
+    for (const [pattern, mappings] of Object.entries(compilerOptions.paths as Record<string, unknown>)) {
+      if (!Array.isArray(mappings)) {
+        continue;
+      }
+      normalizedPaths[pattern] = mappings
+        .filter((mapping): mapping is string => typeof mapping === "string")
+        .map((mapping) => (path.isAbsolute(mapping) ? mapping : path.resolve(resolutionBase, mapping)));
+    }
+    normalized.paths = normalizedPaths;
+  }
+
+  return normalized;
 }
 
 export function readTsconfigInfo(workspaceRoot: string): TsconfigInfo {
@@ -107,10 +190,10 @@ export function readTsconfigInfo(workspaceRoot: string): TsconfigInfo {
 
     try {
       const { compilerOptions, configFiles } = resolveExtendsChain(configPath);
-      const baseUrl = (compilerOptions.baseUrl as string) ?? ".";
-      const paths = (compilerOptions.paths as Record<string, string[]>) ?? {};
+      const baseUrl = compilerOptions.baseUrl ?? null;
+      const paths = compilerOptions.paths ?? {};
 
-      if (Object.keys(paths).length === 0 && !compilerOptions.baseUrl) {
+      if (Object.keys(paths).length === 0 && !baseUrl) {
         return {
           paths: null,
           configFiles,
@@ -158,7 +241,7 @@ export function resolveAliasedImport(
     return null;
   }
 
-  const absoluteBaseUrl = path.resolve(workspaceRoot, tsconfigPaths.baseUrl);
+  const absoluteBaseUrl = tsconfigPaths.baseUrl;
 
   for (const [pattern, mappings] of Object.entries(tsconfigPaths.paths)) {
     const hasWildcard = pattern.includes("*");
@@ -170,7 +253,9 @@ export function resolveAliasedImport(
 
       for (const mapping of mappings) {
         const resolved = mapping.replace("*", rest);
-        const absoluteResolved = path.resolve(absoluteBaseUrl, resolved);
+        const absoluteResolved = path.isAbsolute(resolved)
+          ? resolved
+          : path.resolve(absoluteBaseUrl ?? workspaceRoot, resolved);
         const relativePath = path.relative(workspaceRoot, absoluteResolved);
         const posixRelative = relativePath.split(path.sep).join("/");
 
@@ -181,7 +266,9 @@ export function resolveAliasedImport(
     } else {
       if (moduleSpecifier !== pattern) continue;
       for (const mapping of mappings) {
-        const absoluteResolved = path.resolve(absoluteBaseUrl, mapping);
+        const absoluteResolved = path.isAbsolute(mapping)
+          ? mapping
+          : path.resolve(absoluteBaseUrl ?? workspaceRoot, mapping);
         const relativePath = path.relative(workspaceRoot, absoluteResolved);
         const posixRelative = relativePath.split(path.sep).join("/");
 
@@ -193,7 +280,7 @@ export function resolveAliasedImport(
   }
 
   // Try baseUrl resolution (imports relative to baseUrl without explicit paths entry)
-  {
+  if (absoluteBaseUrl) {
     const absoluteResolved = path.resolve(absoluteBaseUrl, moduleSpecifier);
     const relativePath = path.relative(workspaceRoot, absoluteResolved);
     const posixRelative = relativePath.split(path.sep).join("/");

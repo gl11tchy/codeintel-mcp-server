@@ -34,6 +34,7 @@ interface WorkspaceWatchState {
   gitControlPaths: string[];
   externalWatchPaths: string[];
   ready: Promise<void>;
+  startupState: "pending" | "ready" | "failed";
   timer: NodeJS.Timeout | null;
 }
 
@@ -313,27 +314,40 @@ export class Indexer {
     const existingState = this.watchStates.get(workspace.workspaceId);
     if (existingState) {
       const nextWatchConfig = this.getWatchConfig(workspace.rootPath);
-      existingState.configControlPaths = nextWatchConfig.configControlPaths;
-      existingState.gitControlPaths = nextWatchConfig.gitControlPaths;
-
-      const pathsToAdd = nextWatchConfig.externalWatchPaths.filter(
-        (watchedPath) => !existingState.externalWatchPaths.includes(watchedPath),
-      );
-      const pathsToRemove = existingState.externalWatchPaths.filter(
-        (watchedPath) => !nextWatchConfig.externalWatchPaths.includes(watchedPath),
+      const controlPathsChanged = !this.haveSamePaths(
+        existingState.configControlPaths,
+        nextWatchConfig.configControlPaths,
+      ) || !this.haveSamePaths(
+        existingState.gitControlPaths,
+        nextWatchConfig.gitControlPaths,
       );
 
-      if (pathsToAdd.length > 0) {
-        existingState.watcher.add(pathsToAdd);
+      if (existingState.startupState === "failed" || controlPathsChanged) {
+        this.disposeWatcherState(workspace.workspaceId, existingState);
+      } else {
+        existingState.configControlPaths = nextWatchConfig.configControlPaths;
+        existingState.gitControlPaths = nextWatchConfig.gitControlPaths;
+
+        const pathsToAdd = nextWatchConfig.externalWatchPaths.filter(
+          (watchedPath) => !existingState.externalWatchPaths.includes(watchedPath),
+        );
+        const pathsToRemove = existingState.externalWatchPaths.filter(
+          (watchedPath) => !nextWatchConfig.externalWatchPaths.includes(watchedPath),
+        );
+
+        if (pathsToAdd.length > 0) {
+          existingState.watcher.add(pathsToAdd);
+        }
+        if (pathsToRemove.length > 0) {
+          void existingState.watcher.unwatch(pathsToRemove);
+        }
+        existingState.externalWatchPaths = nextWatchConfig.externalWatchPaths;
+        return;
       }
-      if (pathsToRemove.length > 0) {
-        void existingState.watcher.unwatch(pathsToRemove);
-      }
-      existingState.externalWatchPaths = nextWatchConfig.externalWatchPaths;
-      return;
     }
 
     const watchConfig = this.getWatchConfig(workspace.rootPath);
+    let state: WorkspaceWatchState | undefined;
     const watcher = chokidar.watch([workspace.rootPath, ...watchConfig.externalWatchPaths], {
       ignoreInitial: true,
       awaitWriteFinish: {
@@ -341,10 +355,13 @@ export class Indexer {
         pollInterval: 50,
       },
       ignored: (watchedPath) => {
+        const currentState = this.watchStates.get(workspace.workspaceId) ?? state;
+        const gitControlPaths = currentState?.gitControlPaths ?? watchConfig.gitControlPaths;
+        const configControlPaths = currentState?.configControlPaths ?? watchConfig.configControlPaths;
         const absolutePath = path.resolve(watchedPath);
         if (
-          this.isGitControlPath(absolutePath, watchConfig.gitControlPaths)
-          || this.isConfigControlPath(absolutePath, watchConfig.configControlPaths)
+          this.isGitControlPath(absolutePath, gitControlPaths)
+          || this.isConfigControlPath(absolutePath, configControlPaths)
         ) {
           return false;
         }
@@ -375,6 +392,9 @@ export class Indexer {
         return;
       }
       readySettled = true;
+      if (state) {
+        state.startupState = "ready";
+      }
       resolveReady();
     };
     const rejectWatcherReady = (error: unknown) => {
@@ -382,12 +402,15 @@ export class Indexer {
         return;
       }
       readySettled = true;
+      if (state) {
+        state.startupState = "failed";
+      }
       rejectReady(error instanceof Error ? error : new Error(String(error)));
     };
     watcher.once("ready", resolveWatcherReady);
     void ready.catch(() => {});
 
-    const state: WorkspaceWatchState = {
+    state = {
       watcher,
       queuedChanges: new Map(),
       fullRefreshQueued: false,
@@ -395,6 +418,7 @@ export class Indexer {
       gitControlPaths: watchConfig.gitControlPaths,
       externalWatchPaths: watchConfig.externalWatchPaths,
       ready,
+      startupState: "pending",
       timer: null,
     };
 
@@ -451,6 +475,23 @@ export class Indexer {
     });
 
     this.watchStates.set(workspace.workspaceId, state);
+  }
+
+  private disposeWatcherState(workspaceId: string, state: WorkspaceWatchState): void {
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    this.watchStates.delete(workspaceId);
+    void state.watcher.close();
+  }
+
+  private haveSamePaths(left: string[], right: string[]): boolean {
+    if (left.length !== right.length) {
+      return false;
+    }
+    const rightSet = new Set(right);
+    return left.every((value) => rightSet.has(value));
   }
 
   private async flushWatchQueue(workspaceId: string): Promise<void> {
@@ -599,7 +640,9 @@ export class Indexer {
   }
 
   private isConfigControlPath(absolutePath: string, configControlPaths: string[]): boolean {
-    return configControlPaths.includes(absolutePath);
+    return configControlPaths.some(
+      (controlPath) => absolutePath === controlPath || controlPath.startsWith(`${absolutePath}${path.sep}`),
+    );
   }
 
   private controlFilePath(rootPath: string, absolutePath: string): string {

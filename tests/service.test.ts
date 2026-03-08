@@ -20,7 +20,7 @@ afterEach(async () => {
 });
 
 function createHarness(enableWatch = false) {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codeintel-mcp-test-"));
+  const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codeintel-mcp-test-")));
   const dbPath = path.join(tempRoot, "codeintel.sqlite");
   const service = new CodeIntelService({ dbPath, enableWatch });
 
@@ -206,7 +206,7 @@ describe("CodeIntelService", () => {
       [sharedConfigPath]: JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: ".",
+            baseUrl: "../../..",
             paths: {
               "@lib/*": ["src/*"],
             },
@@ -247,7 +247,7 @@ describe("CodeIntelService", () => {
       JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: ".",
+            baseUrl: "../../..",
             paths: {},
           },
         },
@@ -260,6 +260,98 @@ describe("CodeIntelService", () => {
     const dirtyStatus = service.getWorkspaceStatus(workspaceId);
     expect(dirtyStatus.dirty).toBe(true);
     expect(dirtyStatus.pending_changed_files.some((filePath) => filePath.endsWith(sharedConfigPath))).toBe(true);
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(false);
+  });
+
+  it("supports tsconfig extends arrays and later base configs override earlier ones", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "tsconfig-array-extends");
+    const sharedConfigPath = "config/tsconfig.shared.json";
+    const helperSymbolId = "src/helper.ts::helper#function";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: [
+            "./tsconfig.base.json",
+            "./config/tsconfig.shared.json",
+          ],
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain("config/tsconfig.shared.json");
 
     await service.refreshWorkspace(workspaceId, false);
 
@@ -651,7 +743,7 @@ describe("CodeIntelService", () => {
       "tsconfig.base.json": JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: "../..",
+            baseUrl: ".",
             paths: {},
           },
         },
@@ -693,7 +785,7 @@ describe("CodeIntelService", () => {
       JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: "../..",
+            baseUrl: ".",
             paths: {
               "@lib/*": ["packages/app/src/*"],
             },
@@ -829,7 +921,7 @@ describe("CodeIntelService", () => {
       "tsconfig.base.json": JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: "../..",
+            baseUrl: ".",
             paths: {},
           },
         },
@@ -869,7 +961,7 @@ describe("CodeIntelService", () => {
       JSON.stringify(
         {
           compilerOptions: {
-            baseUrl: "../..",
+            baseUrl: ".",
             paths: {
               "@lib/*": ["packages/app/src/*"],
             },
@@ -887,6 +979,123 @@ describe("CodeIntelService", () => {
         && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
     }, 8000);
   }, 10000);
+
+  it("rebuilds from watch mode when control paths move under ignored directories", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const workspacePath = path.join(tempRoot, "watch-dynamic-config");
+    const sharedConfigPath = "node_modules/@shared/tsconfig.alias.json";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.local.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "./tsconfig.local.json",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@shared/package.json": JSON.stringify(
+        {
+          name: "@shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify(
+        {
+          extends: "@shared/tsconfig.alias.json",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return !refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+  }, 12000);
 
   it("renames a symbol in dry-run mode and then applies the rename", async () => {
     const { tempRoot, service } = createHarness();
