@@ -43,6 +43,7 @@ function isRelativeOrAbsoluteExtends(extendsValue: string): boolean {
 function resolveExtendsPath(configPath: string, extendsValue: string): string {
   const currentDir = path.dirname(configPath);
   if (!isRelativeOrAbsoluteExtends(extendsValue)) {
+    const moduleDirs = getNodeModuleDirs(currentDir);
     const candidates = extendsValue.endsWith(".json")
       ? [extendsValue]
       : [extendsValue, `${extendsValue}.json`];
@@ -50,9 +51,16 @@ function resolveExtendsPath(configPath: string, extendsValue: string): string {
       try {
         return require.resolve(candidate, { paths: [currentDir] });
       } catch {
-        // Fall back to local path handling below.
+        for (const moduleDir of moduleDirs) {
+          const trackedPath = path.join(moduleDir, candidate);
+          if (fs.existsSync(trackedPath)) {
+            return trackedPath;
+          }
+        }
       }
     }
+
+    return path.join(moduleDirs[0] ?? currentDir, candidates[0]);
   }
 
   let resolvedPath = extendsValue.endsWith(".json")
@@ -67,12 +75,10 @@ function resolveExtendsPath(configPath: string, extendsValue: string): string {
 
 function resolveExtendsChain(
   configPath: string,
-  maxDepth = 5,
   visited = new Set<string>(),
-  depth = 0,
 ): { compilerOptions: NormalizedCompilerOptions; configFiles: string[] } {
   const currentPath = path.resolve(configPath);
-  if (depth >= maxDepth || visited.has(currentPath)) {
+  if (visited.has(currentPath)) {
     return {
       compilerOptions: {},
       configFiles: [currentPath],
@@ -100,7 +106,7 @@ function resolveExtendsChain(
       continue;
     }
 
-    const extended = resolveExtendsChain(nextPath, maxDepth, nextVisited, depth + 1);
+    const extended = resolveExtendsChain(nextPath, nextVisited);
     mergedCompilerOptions = mergeCompilerOptions(mergedCompilerOptions, extended.compilerOptions);
     for (const filePath of extended.configFiles) {
       if (!configFiles.includes(filePath)) {
@@ -129,6 +135,18 @@ function normalizeExtendsEntries(extendsValue: unknown): string[] {
     return [];
   }
   return extendsValue.filter((entry): entry is string => typeof entry === "string");
+}
+
+function getNodeModuleDirs(startDir: string): string[] {
+  const moduleDirs: string[] = [];
+  for (let currentDir = startDir; ; currentDir = path.dirname(currentDir)) {
+    moduleDirs.push(path.join(currentDir, "node_modules"));
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      break;
+    }
+  }
+  return moduleDirs;
 }
 
 function mergeCompilerOptions(

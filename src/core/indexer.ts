@@ -34,6 +34,7 @@ interface WorkspaceWatchState {
   gitControlPaths: string[];
   externalWatchPaths: string[];
   ready: Promise<void>;
+  rejectReady: (error: Error) => void;
   startupState: "pending" | "ready" | "failed";
   timer: NodeJS.Timeout | null;
 }
@@ -358,6 +359,7 @@ export class Indexer {
         const currentState = this.watchStates.get(workspace.workspaceId) ?? state;
         const gitControlPaths = currentState?.gitControlPaths ?? watchConfig.gitControlPaths;
         const configControlPaths = currentState?.configControlPaths ?? watchConfig.configControlPaths;
+        const externalWatchPaths = currentState?.externalWatchPaths ?? watchConfig.externalWatchPaths;
         const absolutePath = path.resolve(watchedPath);
         if (
           this.isGitControlPath(absolutePath, gitControlPaths)
@@ -367,8 +369,11 @@ export class Indexer {
         }
 
         const relativePath = relativeWorkspacePath(workspace.rootPath, watchedPath);
-        if (!relativePath || relativePath.startsWith("..")) {
+        if (!relativePath) {
           return false;
+        }
+        if (relativePath.startsWith("..")) {
+          return !externalWatchPaths.includes(absolutePath);
         }
         if (DEFAULT_EXCLUDE_GLOBS.some((pattern) => minimatch(relativePath, pattern, { dot: true }))) {
           return true;
@@ -418,6 +423,7 @@ export class Indexer {
       gitControlPaths: watchConfig.gitControlPaths,
       externalWatchPaths: watchConfig.externalWatchPaths,
       ready,
+      rejectReady: (error) => rejectWatcherReady(error),
       startupState: "pending",
       timer: null,
     };
@@ -478,6 +484,9 @@ export class Indexer {
   }
 
   private disposeWatcherState(workspaceId: string, state: WorkspaceWatchState): void {
+    if (state.startupState === "pending") {
+      state.rejectReady(new Error(`Watcher for ${workspaceId} was disposed before becoming ready`));
+    }
     if (state.timer) {
       clearTimeout(state.timer);
       state.timer = null;

@@ -807,6 +807,126 @@ describe("CodeIntelService", () => {
     expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
   });
 
+  it("tracks missing package-based extends under node_modules and rebuilds when they appear", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "missing-package-extends");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "@shared/tsconfig.alias.json",
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    writeWorkspaceFiles(workspacePath, {
+      "node_modules/@shared/package.json": JSON.stringify(
+        {
+          name: "@shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@shared/tsconfig.alias.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    });
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain("node_modules/@shared/tsconfig.alias.json");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
+  it("resolves aliases through deep tsconfig extends chains", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "deep-extends");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "./configs/base1.json",
+        },
+        null,
+        2,
+      ),
+      "configs/base1.json": JSON.stringify({ extends: "./base2.json" }, null, 2),
+      "configs/base2.json": JSON.stringify({ extends: "./base3.json" }, null, 2),
+      "configs/base3.json": JSON.stringify({ extends: "./base4.json" }, null, 2),
+      "configs/base4.json": JSON.stringify({ extends: "./base5.json" }, null, 2),
+      "configs/base5.json": JSON.stringify({ extends: "./base6.json" }, null, 2),
+      "configs/base6.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const helperSymbolId = "src/helper.ts::helper#function";
+    const refs = service.findReferences(indexed.workspace.workspace_id, helperSymbolId, true, 20, 0);
+
+    expect(refs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
   it("treats git revision changes as full-rebuild boundaries", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-lib");
