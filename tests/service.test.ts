@@ -180,6 +180,93 @@ describe("CodeIntelService", () => {
     expect(renderRefFiles).toContain("src/index.ts"); // import via ~components/ alias
   });
 
+  it("resolves package-based tsconfig extends and tracks shared config changes", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "tsconfig-package-extends");
+    const sharedConfigPath = "node_modules/@tsconfig/shared/tsconfig.json";
+    const helperSymbolId = "src/helper.ts::helper#function";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "@tsconfig/shared/tsconfig.json",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@tsconfig/shared/package.json": JSON.stringify(
+        {
+          name: "@tsconfig/shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files.some((filePath) => filePath.endsWith(sharedConfigPath))).toBe(true);
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(false);
+  });
+
   it("FTS5 search finds camelCase symbols by substring tokens", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-alias");

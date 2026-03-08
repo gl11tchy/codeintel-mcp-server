@@ -363,9 +363,29 @@ export class Indexer {
       },
     });
 
-    const ready = new Promise<void>((resolve) => {
-      watcher.once("ready", () => resolve());
+    let readySettled = false;
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
     });
+    const resolveWatcherReady = () => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      resolveReady();
+    };
+    const rejectWatcherReady = (error: unknown) => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      rejectReady(error instanceof Error ? error : new Error(String(error)));
+    };
+    watcher.once("ready", resolveWatcherReady);
+    void ready.catch(() => {});
 
     const state: WorkspaceWatchState = {
       watcher,
@@ -420,6 +440,7 @@ export class Indexer {
       queueChange(absolutePath, "unlink");
     });
     watcher.on("error", (error) => {
+      rejectWatcherReady(error);
       state.fullRefreshQueued = true;
       this.store.setWorkspaceWatchState(
         workspace.workspaceId,

@@ -1,5 +1,8 @@
+import { createRequire } from "node:module";
 import fs from "node:fs";
 import path from "node:path";
+
+const require = createRequire(import.meta.url);
 
 export interface TsconfigPaths {
   baseUrl: string;
@@ -22,8 +25,31 @@ function parseTsconfigFile(configPath: string): Record<string, unknown> | null {
   }
 }
 
+function isRelativeOrAbsoluteExtends(extendsValue: string): boolean {
+  return (
+    extendsValue === "."
+    || extendsValue === ".."
+    || extendsValue.startsWith("./")
+    || extendsValue.startsWith("../")
+    || path.isAbsolute(extendsValue)
+  );
+}
+
 function resolveExtendsPath(configPath: string, extendsValue: string): string {
   const currentDir = path.dirname(configPath);
+  if (!isRelativeOrAbsoluteExtends(extendsValue)) {
+    const candidates = extendsValue.endsWith(".json")
+      ? [extendsValue]
+      : [extendsValue, `${extendsValue}.json`];
+    for (const candidate of candidates) {
+      try {
+        return require.resolve(candidate, { paths: [currentDir] });
+      } catch {
+        // Fall back to local path handling below.
+      }
+    }
+  }
+
   let resolvedPath = extendsValue.endsWith(".json")
     ? path.resolve(currentDir, extendsValue)
     : path.resolve(currentDir, `${extendsValue}.json`);
