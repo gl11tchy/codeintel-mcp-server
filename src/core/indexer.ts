@@ -10,7 +10,7 @@ import type { Store } from "../db/store.js";
 import { parseFile } from "../parser/extract.js";
 import type { IndexedFile, WorkspaceConfig, WorkspaceRecord } from "../types.js";
 import type { Resolver } from "./resolver.js";
-import { readTsconfigPaths, type TsconfigPaths } from "./tsconfig.js";
+import { readTsconfigInfo, readTsconfigPaths, type TsconfigPaths } from "./tsconfig.js";
 import {
   DEFAULT_EXCLUDE_GLOBS,
   getGitWatchPaths,
@@ -21,6 +21,7 @@ import {
   languageFromFilePath,
   readGitRevision,
   relativeWorkspacePath,
+  toPosixPath,
 } from "./utils.js";
 
 const CONTROL_FILE_PATHS = ["tsconfig.json", "jsconfig.json"] as const;
@@ -29,7 +30,10 @@ interface WorkspaceWatchState {
   watcher: FSWatcher;
   queuedChanges: Map<string, "change" | "unlink">;
   fullRefreshQueued: boolean;
+  configControlPaths: string[];
   gitControlPaths: string[];
+  externalWatchPaths: string[];
+  ready: Promise<void>;
   timer: NodeJS.Timeout | null;
 }
 
@@ -64,6 +68,10 @@ export class Indexer {
       await watchState.watcher.close();
     }
     this.watchStates.clear();
+  }
+
+  async waitForWatcherReady(workspaceId: string): Promise<void> {
+    await this.watchStates.get(workspaceId)?.ready;
   }
 
   async performFullIndex(config: WorkspaceConfig): Promise<void> {
@@ -302,12 +310,31 @@ export class Indexer {
   }
 
   private ensureWatcher(workspace: WorkspaceConfig): void {
-    if (this.watchStates.has(workspace.workspaceId)) {
+    const existingState = this.watchStates.get(workspace.workspaceId);
+    if (existingState) {
+      const nextWatchConfig = this.getWatchConfig(workspace.rootPath);
+      existingState.configControlPaths = nextWatchConfig.configControlPaths;
+      existingState.gitControlPaths = nextWatchConfig.gitControlPaths;
+
+      const pathsToAdd = nextWatchConfig.externalWatchPaths.filter(
+        (watchedPath) => !existingState.externalWatchPaths.includes(watchedPath),
+      );
+      const pathsToRemove = existingState.externalWatchPaths.filter(
+        (watchedPath) => !nextWatchConfig.externalWatchPaths.includes(watchedPath),
+      );
+
+      if (pathsToAdd.length > 0) {
+        existingState.watcher.add(pathsToAdd);
+      }
+      if (pathsToRemove.length > 0) {
+        void existingState.watcher.unwatch(pathsToRemove);
+      }
+      existingState.externalWatchPaths = nextWatchConfig.externalWatchPaths;
       return;
     }
 
-    const gitControlPaths = getGitWatchPaths(workspace.rootPath).map((watchedPath) => path.resolve(watchedPath));
-    const watcher = chokidar.watch([workspace.rootPath, ...gitControlPaths], {
+    const watchConfig = this.getWatchConfig(workspace.rootPath);
+    const watcher = chokidar.watch([workspace.rootPath, ...watchConfig.externalWatchPaths], {
       ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: 250,
@@ -315,7 +342,10 @@ export class Indexer {
       },
       ignored: (watchedPath) => {
         const absolutePath = path.resolve(watchedPath);
-        if (this.isGitControlPath(absolutePath, gitControlPaths)) {
+        if (
+          this.isGitControlPath(absolutePath, watchConfig.gitControlPaths)
+          || this.isConfigControlPath(absolutePath, watchConfig.configControlPaths)
+        ) {
           return false;
         }
 
@@ -333,11 +363,18 @@ export class Indexer {
       },
     });
 
+    const ready = new Promise<void>((resolve) => {
+      watcher.once("ready", () => resolve());
+    });
+
     const state: WorkspaceWatchState = {
       watcher,
       queuedChanges: new Map(),
       fullRefreshQueued: false,
-      gitControlPaths,
+      configControlPaths: watchConfig.configControlPaths,
+      gitControlPaths: watchConfig.gitControlPaths,
+      externalWatchPaths: watchConfig.externalWatchPaths,
+      ready,
       timer: null,
     };
 
@@ -356,6 +393,16 @@ export class Indexer {
       if (this.isGitControlPath(resolvedPath, state.gitControlPaths)) {
         state.fullRefreshQueued = true;
         schedule();
+        return;
+      }
+      if (this.isConfigControlPath(resolvedPath, state.configControlPaths)) {
+        state.fullRefreshQueued = true;
+        schedule();
+        return;
+      }
+
+      const relativePath = relativeWorkspacePath(workspace.rootPath, resolvedPath);
+      if (!relativePath || relativePath.startsWith("..")) {
         return;
       }
 
@@ -447,27 +494,29 @@ export class Indexer {
   }
 
   private detectChangedControlFiles(workspace: WorkspaceConfig): string[] {
-    const previousStates = new Map(
-      this.store
-        .getWorkspaceControlFileStates(workspace.workspaceId)
-        .map((state) => [state.filePath, state] as const),
-    );
+    const previousStates = new Map(this.store.getWorkspaceControlFileStates(workspace.workspaceId).map((state) => [state.filePath, state] as const));
+    const currentStates = new Map(this.readControlFileStates(workspace.rootPath).map((state) => [state.filePath, state] as const));
+    const controlFilePaths = Array.from(new Set([...previousStates.keys(), ...currentStates.keys()]));
 
-    return this.readControlFileStates(workspace.rootPath)
-      .filter((state) => {
-        const previous = previousStates.get(state.filePath);
-        if (!previous) {
-          return state.isPresent;
-        }
-        return previous.isPresent !== state.isPresent || previous.contentHash !== state.contentHash;
+    return controlFilePaths
+      .filter((filePath) => {
+        const previous = previousStates.get(filePath);
+        const current = currentStates.get(filePath);
+        return (
+          previous?.isPresent !== current?.isPresent
+          || previous?.contentHash !== current?.contentHash
+        );
       })
-      .map((state) => state.filePath)
       .sort((left, right) => left.localeCompare(right));
   }
 
   private readControlFileStates(rootPath: string): Array<{ filePath: string; isPresent: boolean; contentHash: string | null }> {
-    return CONTROL_FILE_PATHS.map((filePath) => {
-      const absolutePath = path.join(rootPath, filePath);
+    const rootControlPaths = CONTROL_FILE_PATHS.map((filePath) => path.join(rootPath, filePath));
+    const tsconfigInfo = readTsconfigInfo(rootPath);
+    const controlPaths = Array.from(new Set([...rootControlPaths, ...tsconfigInfo.configFiles]));
+
+    return controlPaths.map((absolutePath) => {
+      const filePath = this.controlFilePath(rootPath, absolutePath);
       if (!fs.existsSync(absolutePath)) {
         return {
           filePath,
@@ -496,6 +545,7 @@ export class Indexer {
     const files = this.store.getFiles(workspace.workspaceId);
     const knownFiles = new Set(files.map((file) => file.filePath));
     const targets = new Set(targetFilePaths);
+    const resolutionFileSet = new Set([...knownFiles, ...targetFilePaths]);
     const dependents = new Set<string>();
 
     for (const file of files) {
@@ -508,7 +558,7 @@ export class Indexer {
           workspace,
           file,
           binding,
-          knownFiles,
+          resolutionFileSet,
           tsconfigPaths,
         );
         if (resolvedTarget && targets.has(resolvedTarget)) {
@@ -525,6 +575,33 @@ export class Indexer {
     return gitControlPaths.some(
       (controlPath) => absolutePath === controlPath || absolutePath.startsWith(`${controlPath}${path.sep}`),
     );
+  }
+
+  private isConfigControlPath(absolutePath: string, configControlPaths: string[]): boolean {
+    return configControlPaths.includes(absolutePath);
+  }
+
+  private controlFilePath(rootPath: string, absolutePath: string): string {
+    const relativePath = relativeWorkspacePath(rootPath, absolutePath);
+    return !relativePath || relativePath.startsWith("..") ? toPosixPath(absolutePath) : relativePath;
+  }
+
+  private getWatchConfig(rootPath: string): {
+    configControlPaths: string[];
+    gitControlPaths: string[];
+    externalWatchPaths: string[];
+  } {
+    const gitControlPaths = getGitWatchPaths(rootPath).map((watchedPath) => path.resolve(watchedPath));
+    const configControlPaths = readTsconfigInfo(rootPath).configFiles.map((watchedPath) => path.resolve(watchedPath));
+    const externalConfigWatchPaths = configControlPaths
+      .filter((controlPath) => relativeWorkspacePath(rootPath, controlPath).startsWith(".."))
+      .map((controlPath) => (fs.existsSync(controlPath) ? controlPath : path.dirname(controlPath)));
+
+    return {
+      configControlPaths,
+      gitControlPaths,
+      externalWatchPaths: Array.from(new Set([...gitControlPaths, ...externalConfigWatchPaths])),
+    };
   }
 
   private collectChangedSymbolNames(

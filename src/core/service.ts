@@ -284,6 +284,9 @@ export class CodeIntelService {
   getFileOutline(workspaceId: string, filePath: string): FileOutlineResult {
     this.requireWorkspace(workspaceId);
     const file = this.store.getFile(workspaceId, filePath);
+    if (!file) {
+      throw new Error(`Indexed file not found: ${filePath}`);
+    }
     const symbols = this.store.getFileSymbols(workspaceId, filePath);
     const nodesById = new Map<string, OutlineNode>();
     const roots: OutlineNode[] = [];
@@ -313,7 +316,7 @@ export class CodeIntelService {
 
     return {
       file_path: filePath,
-      parse_error: file?.parseError ?? null,
+      parse_error: file.parseError,
       items: roots,
     };
   }
@@ -595,6 +598,11 @@ export class CodeIntelService {
       watch_status: workspace?.watchStatus,
       ...extra,
     };
+  }
+
+  async waitForWatcherReady(workspaceId: string): Promise<void> {
+    this.requireWorkspace(workspaceId);
+    await this.indexer.waitForWatcherReady(workspaceId);
   }
 
   renameSymbol(workspaceId: string, symbolId: string, newName: string, dryRun = true): RenameResult {

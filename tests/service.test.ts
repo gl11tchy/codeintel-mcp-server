@@ -311,6 +311,70 @@ describe("CodeIntelService", () => {
     expect(importEdgesAfter).toEqual([]);
   });
 
+  it("rebuilds import-only dependents when the imported file is deleted", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "import-delete");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "src/helper.ts": [
+        "export function helper(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "src/importer.ts": [
+        'import { helper } from "./helper";',
+        "",
+        "export const loaded = true;",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    const importEdgesBefore = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesBefore).toEqual([
+      {
+        file_path: "src/importer.ts",
+        target_symbol_id: "src/helper.ts::helper#function",
+        role: "import",
+      },
+    ]);
+
+    fs.rmSync(path.join(workspacePath, "src/helper.ts"));
+    await service.refreshWorkspace(workspaceId, false);
+
+    const importEdgesAfter = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesAfter).toEqual([]);
+  });
+
   it("rebuilds name-based references when uniqueness changes during refresh", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = path.join(tempRoot, "name-resolution");
@@ -479,6 +543,91 @@ describe("CodeIntelService", () => {
     expect(refreshedRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
   });
 
+  it("rejects outlines for files that are not indexed", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+
+    expect(() => service.getFileOutline(indexed.workspace.workspace_id, "src/missing.ts")).toThrow(
+      "Indexed file not found: src/missing.ts",
+    );
+  });
+
+  it("forces a full rebuild when an extended tsconfig file changes", async () => {
+    const { tempRoot, service } = createHarness();
+    const monorepoRoot = path.join(tempRoot, "monorepo");
+    const workspacePath = path.join(monorepoRoot, "packages", "app");
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const baseConfigPath = path.join(monorepoRoot, "tsconfig.base.json");
+    writeWorkspaceFiles(monorepoRoot, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "packages/app/tsconfig.json": JSON.stringify(
+        {
+          extends: "../../tsconfig.base.json",
+        },
+        null,
+        2,
+      ),
+      "packages/app/src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "packages/app/src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    fs.writeFileSync(
+      baseConfigPath,
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["packages/app/src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain(baseConfigPath.split(path.sep).join("/"));
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
   it("treats git revision changes as full-rebuild boundaries", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-lib");
@@ -519,7 +668,7 @@ describe("CodeIntelService", () => {
     const workspaceId = indexed.workspace.workspace_id;
     const initialRevision = indexed.workspace.indexed_revision;
 
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await service.waitForWatcherReady(workspaceId);
 
     execFileSync("git", ["commit", "--allow-empty", "-m", "noop"], { cwd: workspacePath });
 
@@ -554,7 +703,7 @@ describe("CodeIntelService", () => {
     const workspaceId = indexed.workspace.workspace_id;
     const helperSymbolId = "src/unique.ts::helper#function";
 
-    await new Promise((resolve) => setTimeout(resolve, 150));
+    await service.waitForWatcherReady(workspaceId);
 
     fs.writeFileSync(
       path.join(workspacePath, "src/duplicate.ts"),
@@ -581,6 +730,76 @@ describe("CodeIntelService", () => {
         && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
     });
   });
+
+  it("rebuilds from watch mode when an extended tsconfig file changes", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const monorepoRoot = path.join(tempRoot, "watch-monorepo");
+    const workspacePath = path.join(monorepoRoot, "packages", "app");
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const baseConfigPath = path.join(monorepoRoot, "tsconfig.base.json");
+    writeWorkspaceFiles(monorepoRoot, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "packages/app/tsconfig.json": JSON.stringify(
+        {
+          extends: "../../tsconfig.base.json",
+        },
+        null,
+        2,
+      ),
+      "packages/app/src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "packages/app/src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      baseConfigPath,
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["packages/app/src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+  }, 10000);
 
   it("renames a symbol in dry-run mode and then applies the rename", async () => {
     const { tempRoot, service } = createHarness();

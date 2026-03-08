@@ -6,6 +6,11 @@ export interface TsconfigPaths {
   paths: Record<string, string[]>;
 }
 
+export interface TsconfigInfo {
+  paths: TsconfigPaths | null;
+  configFiles: string[];
+}
+
 function parseTsconfigFile(configPath: string): Record<string, unknown> | null {
   try {
     const raw = fs.readFileSync(configPath, "utf8");
@@ -17,11 +22,32 @@ function parseTsconfigFile(configPath: string): Record<string, unknown> | null {
   }
 }
 
-function resolveExtendsChain(configPath: string, maxDepth = 5): Record<string, unknown> {
-  let mergedCompilerOptions: Record<string, unknown> = {};
+function resolveExtendsPath(configPath: string, extendsValue: string): string {
+  const currentDir = path.dirname(configPath);
+  let resolvedPath = extendsValue.endsWith(".json")
+    ? path.resolve(currentDir, extendsValue)
+    : path.resolve(currentDir, `${extendsValue}.json`);
+  if (!fs.existsSync(resolvedPath) && !extendsValue.endsWith(".json")) {
+    // Try without appending .json (the original path might resolve as-is via node_modules, etc.)
+    resolvedPath = path.resolve(currentDir, extendsValue);
+  }
+  return resolvedPath;
+}
 
-  let currentPath = configPath;
+function resolveExtendsChain(
+  configPath: string,
+  maxDepth = 5,
+): { compilerOptions: Record<string, unknown>; configFiles: string[] } {
+  let mergedCompilerOptions: Record<string, unknown> = {};
+  const configFiles: string[] = [];
+
+  let currentPath = path.resolve(configPath);
   for (let depth = 0; depth < maxDepth; depth++) {
+    if (configFiles.includes(currentPath)) {
+      break;
+    }
+    configFiles.push(currentPath);
+
     const config = parseTsconfigFile(currentPath);
     if (!config) break;
 
@@ -32,40 +58,58 @@ function resolveExtendsChain(configPath: string, maxDepth = 5): Record<string, u
     const extendsValue = config.extends;
     if (typeof extendsValue !== "string") break;
 
-    const currentDir = path.dirname(currentPath);
-    currentPath = extendsValue.endsWith(".json")
-      ? path.resolve(currentDir, extendsValue)
-      : path.resolve(currentDir, `${extendsValue}.json`);
-    if (!fs.existsSync(currentPath) && !extendsValue.endsWith(".json")) {
-      // Try without appending .json (the original path might resolve as-is via node_modules, etc.)
-      currentPath = path.resolve(currentDir, extendsValue);
+    const nextPath = resolveExtendsPath(currentPath, extendsValue);
+    if (!fs.existsSync(nextPath)) {
+      if (!configFiles.includes(nextPath)) {
+        configFiles.push(nextPath);
+      }
+      break;
     }
-    if (!fs.existsSync(currentPath)) break;
+    currentPath = nextPath;
   }
 
-  return mergedCompilerOptions;
+  return {
+    compilerOptions: mergedCompilerOptions,
+    configFiles,
+  };
 }
 
-export function readTsconfigPaths(workspaceRoot: string): TsconfigPaths | null {
+export function readTsconfigInfo(workspaceRoot: string): TsconfigInfo {
   for (const filename of ["tsconfig.json", "jsconfig.json"]) {
     const configPath = path.join(workspaceRoot, filename);
     if (!fs.existsSync(configPath)) continue;
 
     try {
-      const compilerOptions = resolveExtendsChain(configPath);
+      const { compilerOptions, configFiles } = resolveExtendsChain(configPath);
       const baseUrl = (compilerOptions.baseUrl as string) ?? ".";
       const paths = (compilerOptions.paths as Record<string, string[]>) ?? {};
 
       if (Object.keys(paths).length === 0 && !compilerOptions.baseUrl) {
-        return null;
+        return {
+          paths: null,
+          configFiles,
+        };
       }
 
-      return { baseUrl, paths };
+      return {
+        paths: { baseUrl, paths },
+        configFiles,
+      };
     } catch {
-      return null;
+      return {
+        paths: null,
+        configFiles: [configPath],
+      };
     }
   }
-  return null;
+  return {
+    paths: null,
+    configFiles: [],
+  };
+}
+
+export function readTsconfigPaths(workspaceRoot: string): TsconfigPaths | null {
+  return readTsconfigInfo(workspaceRoot).paths;
 }
 
 const RESOLVE_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
