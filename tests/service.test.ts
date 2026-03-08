@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -18,10 +19,10 @@ afterEach(async () => {
   }
 });
 
-function createHarness() {
-  const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "codeintel-mcp-test-"));
+function createHarness(enableWatch = false) {
+  const tempRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "codeintel-mcp-test-")));
   const dbPath = path.join(tempRoot, "codeintel.sqlite");
-  const service = new CodeIntelService({ dbPath, enableWatch: false });
+  const service = new CodeIntelService({ dbPath, enableWatch });
 
   cleanupTasks.push(async () => {
     await service.close();
@@ -36,6 +37,26 @@ function copyFixture(tempRoot: string, fixtureName: string) {
   const destination = path.join(tempRoot, fixtureName);
   fs.cpSync(source, destination, { recursive: true });
   return destination;
+}
+
+function writeWorkspaceFiles(workspacePath: string, files: Record<string, string>) {
+  for (const [relativePath, content] of Object.entries(files)) {
+    const absolutePath = path.join(workspacePath, relativePath);
+    fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
+    fs.writeFileSync(absolutePath, content, "utf8");
+  }
+}
+
+async function waitForCondition(condition: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (condition()) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  expect(condition()).toBe(true);
 }
 
 describe("CodeIntelService", () => {
@@ -93,7 +114,7 @@ describe("CodeIntelService", () => {
 
     const pythonIndexed = await service.indexWorkspace({ path: pythonPath });
     const outline = service.getFileOutline(pythonIndexed.workspace.workspace_id, "util.py");
-    expect(outline.some((node) => node.qualified_name === "Greeter")).toBe(true);
+    expect(outline.items.some((node) => node.qualified_name === "Greeter")).toBe(true);
 
     const slugifySymbol = service.searchSymbols({
       workspaceId: pythonIndexed.workspace.workspace_id,
@@ -159,6 +180,185 @@ describe("CodeIntelService", () => {
     expect(renderRefFiles).toContain("src/index.ts"); // import via ~components/ alias
   });
 
+  it("resolves package-based tsconfig extends and tracks shared config changes", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "tsconfig-package-extends");
+    const sharedConfigPath = "node_modules/@tsconfig/shared/tsconfig.json";
+    const helperSymbolId = "src/helper.ts::helper#function";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "@tsconfig/shared/tsconfig.json",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@tsconfig/shared/package.json": JSON.stringify(
+        {
+          name: "@tsconfig/shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../../..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../../..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files.some((filePath) => filePath.endsWith(sharedConfigPath))).toBe(true);
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(false);
+  });
+
+  it("supports tsconfig extends arrays and later base configs override earlier ones", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "tsconfig-array-extends");
+    const sharedConfigPath = "config/tsconfig.shared.json";
+    const helperSymbolId = "src/helper.ts::helper#function";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: [
+            "./tsconfig.base.json",
+            "./config/tsconfig.shared.json",
+          ],
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain("config/tsconfig.shared.json");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(false);
+  });
+
   it("FTS5 search finds camelCase symbols by substring tokens", async () => {
     const { tempRoot, service } = createHarness();
     const workspacePath = copyFixture(tempRoot, "ts-alias");
@@ -185,6 +385,837 @@ describe("CodeIntelService", () => {
     expect(userSearch.items.some((item) => item.name === "formatUserName")).toBe(true);
     expect(userSearch.items.some((item) => item.name === "renderUserCard")).toBe(true);
   });
+
+  it("indexes JavaScript and reports parse recovery diagnostics", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "js-app");
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    expect(indexed.languages.javascript).toBe(3);
+    expect(indexed.parse_issue_count).toBe(1);
+    expect(indexed.parse_issue_files).toEqual(["src/broken.js"]);
+
+    const addSymbol = service.searchSymbols({
+      workspaceId,
+      query: "add",
+      limit: 10,
+      offset: 0,
+    }).items.find((item) => item.name === "add");
+    expect(addSymbol).toBeDefined();
+
+    const refs = service.findReferences(workspaceId, addSymbol!.symbol_id, true, 20, 0);
+    expect(refs.items.some((item) => item.file_path === "src/index.js")).toBe(true);
+
+    const outline = service.getFileOutline(workspaceId, "src/broken.js");
+    expect(outline.parse_error).toBe("Parser reported syntax recovery.");
+
+    const status = service.getWorkspaceStatus(workspaceId);
+    expect(status.parse_issue_count).toBe(1);
+    expect(status.parse_issue_files).toEqual(["src/broken.js"]);
+  });
+
+  it("rebuilds import-only dependents when an export is renamed during refresh", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "import-only");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "src/helper.ts": [
+        "export function helper(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "src/importer.ts": [
+        'import { helper } from "./helper";',
+        "",
+        "export const loaded = true;",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    const importEdgesBefore = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesBefore).toEqual([
+      {
+        file_path: "src/importer.ts",
+        target_symbol_id: "src/helper.ts::helper#function",
+        role: "import",
+      },
+    ]);
+
+    fs.writeFileSync(
+      path.join(workspacePath, "src/helper.ts"),
+      [
+        "export function util(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const importEdgesAfter = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesAfter).toEqual([]);
+  });
+
+  it("rebuilds import-only dependents when the imported file is deleted", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "import-delete");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "src/helper.ts": [
+        "export function helper(): number {",
+        "  return 1;",
+        "}",
+        "",
+      ].join("\n"),
+      "src/importer.ts": [
+        'import { helper } from "./helper";',
+        "",
+        "export const loaded = true;",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    const importEdgesBefore = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesBefore).toEqual([
+      {
+        file_path: "src/importer.ts",
+        target_symbol_id: "src/helper.ts::helper#function",
+        role: "import",
+      },
+    ]);
+
+    fs.rmSync(path.join(workspacePath, "src/helper.ts"));
+    await service.refreshWorkspace(workspaceId, false);
+
+    const importEdgesAfter = service.store.db
+      .prepare(
+        `
+          SELECT file_path, target_symbol_id, role
+          FROM references_resolved
+          WHERE workspace_id = ? AND file_path = ?
+          ORDER BY line ASC, column ASC
+        `,
+      )
+      .all(workspaceId, "src/importer.ts") as Array<{
+      file_path: string;
+      target_symbol_id: string | null;
+      role: string;
+    }>;
+    expect(importEdgesAfter).toEqual([]);
+  });
+
+  it("rebuilds name-based references when uniqueness changes during refresh", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "name-resolution");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "src/unique.ts": [
+        "export function helper(): string {",
+        '  return "one";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/consumer.ts": [
+        "export function useHelper(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/unique.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/consumer.ts")).toBe(true);
+
+    fs.writeFileSync(
+      path.join(workspacePath, "src/duplicate.ts"),
+      [
+        "export function helper(): string {",
+        '  return "two";',
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const duplicateRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(duplicateRefs.items.some((item) => item.file_path === "src/consumer.ts")).toBe(false);
+
+    fs.rmSync(path.join(workspacePath, "src/duplicate.ts"));
+    await service.refreshWorkspace(workspaceId, false);
+
+    const restoredRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(restoredRefs.items.some((item) => item.file_path === "src/consumer.ts")).toBe(true);
+  });
+
+  it("forces a full rebuild when tsconfig path aliases change", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "config-rebuild");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    const tsconfigPath = path.join(workspacePath, "tsconfig.json");
+    fs.writeFileSync(
+      tsconfigPath,
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    const bumpedTime = new Date(Date.now() + 2000);
+    fs.utimesSync(tsconfigPath, bumpedTime, bumpedTime);
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.pending_changed_files).toContain("tsconfig.json");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
+  it("forces a full rebuild when tsconfig.json is deleted", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "config-delete");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+
+    fs.rmSync(path.join(workspacePath, "tsconfig.json"));
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain("tsconfig.json");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+  });
+
+  it("rejects outlines for files that are not indexed", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+
+    expect(() => service.getFileOutline(indexed.workspace.workspace_id, "src/missing.ts")).toThrow(
+      "Indexed file not found: src/missing.ts",
+    );
+  });
+
+  it("forces a full rebuild when an extended tsconfig file changes", async () => {
+    const { tempRoot, service } = createHarness();
+    const monorepoRoot = path.join(tempRoot, "monorepo");
+    const workspacePath = path.join(monorepoRoot, "packages", "app");
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const baseConfigPath = path.join(monorepoRoot, "tsconfig.base.json");
+    writeWorkspaceFiles(monorepoRoot, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "packages/app/tsconfig.json": JSON.stringify(
+        {
+          extends: "../../tsconfig.base.json",
+        },
+        null,
+        2,
+      ),
+      "packages/app/src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "packages/app/src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    fs.writeFileSync(
+      baseConfigPath,
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {
+              "@lib/*": ["packages/app/src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain(baseConfigPath.split(path.sep).join("/"));
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
+  it("tracks missing package-based extends under node_modules and rebuilds when they appear", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "missing-package-extends");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "@shared/tsconfig.alias.json",
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    writeWorkspaceFiles(workspacePath, {
+      "node_modules/@shared/package.json": JSON.stringify(
+        {
+          name: "@shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@shared/tsconfig.alias.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+    });
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain("node_modules/@shared/tsconfig.alias.json");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(refreshedRefs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
+  it("resolves aliases through deep tsconfig extends chains", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = path.join(tempRoot, "deep-extends");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "./configs/base1.json",
+        },
+        null,
+        2,
+      ),
+      "configs/base1.json": JSON.stringify({ extends: "./base2.json" }, null, 2),
+      "configs/base2.json": JSON.stringify({ extends: "./base3.json" }, null, 2),
+      "configs/base3.json": JSON.stringify({ extends: "./base4.json" }, null, 2),
+      "configs/base4.json": JSON.stringify({ extends: "./base5.json" }, null, 2),
+      "configs/base5.json": JSON.stringify({ extends: "./base6.json" }, null, 2),
+      "configs/base6.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const helperSymbolId = "src/helper.ts::helper#function";
+    const refs = service.findReferences(indexed.workspace.workspace_id, helperSymbolId, true, 20, 0);
+
+    expect(refs.items.some((item) => item.file_path === "src/index.ts")).toBe(true);
+  });
+
+  it("treats git revision changes as full-rebuild boundaries", async () => {
+    const { tempRoot, service } = createHarness();
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+
+    execFileSync("git", ["init", "-b", "main"], { cwd: workspacePath });
+    execFileSync("git", ["config", "user.name", "Codex"], { cwd: workspacePath });
+    execFileSync("git", ["config", "user.email", "codex@example.com"], { cwd: workspacePath });
+    execFileSync("git", ["add", "."], { cwd: workspacePath });
+    execFileSync("git", ["commit", "-m", "initial"], { cwd: workspacePath });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+
+    execFileSync("git", ["commit", "--allow-empty", "-m", "noop"], { cwd: workspacePath });
+
+    const dirtyStatus = service.getWorkspaceStatus(workspaceId);
+    expect(dirtyStatus.dirty).toBe(true);
+    expect(dirtyStatus.pending_changed_files).toContain(".git/HEAD");
+
+    await service.refreshWorkspace(workspaceId, false);
+
+    const refreshedStatus = service.getWorkspaceStatus(workspaceId);
+    expect(refreshedStatus.dirty).toBe(false);
+    expect(refreshedStatus.current_git_revision).toBe(refreshedStatus.workspace.indexed_revision);
+  });
+
+  it("rebuilds from watch mode when git revision files change", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const workspacePath = copyFixture(tempRoot, "ts-lib");
+
+    execFileSync("git", ["init", "-b", "main"], { cwd: workspacePath });
+    execFileSync("git", ["config", "user.name", "Codex"], { cwd: workspacePath });
+    execFileSync("git", ["config", "user.email", "codex@example.com"], { cwd: workspacePath });
+    execFileSync("git", ["add", "."], { cwd: workspacePath });
+    execFileSync("git", ["commit", "-m", "initial"], { cwd: workspacePath });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const initialRevision = indexed.workspace.indexed_revision;
+
+    await service.waitForWatcherReady(workspaceId);
+
+    execFileSync("git", ["commit", "--allow-empty", "-m", "noop"], { cwd: workspacePath });
+
+    await waitForCondition(() => {
+      const status = service.getWorkspaceStatus(workspaceId);
+      return status.workspace.indexed_revision !== initialRevision
+        && status.current_git_revision === status.workspace.indexed_revision
+        && status.pending_change_count === 0;
+    }, 8000);
+  });
+
+  it("uses the same name-based invalidation logic in watch mode", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const workspacePath = path.join(tempRoot, "watch-resolution");
+    fs.mkdirSync(workspacePath, { recursive: true });
+    writeWorkspaceFiles(workspacePath, {
+      "src/unique.ts": [
+        "export function helper(): string {",
+        '  return "one";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/consumer.ts": [
+        "export function useHelper(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/unique.ts::helper#function";
+
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      path.join(workspacePath, "src/duplicate.ts"),
+      [
+        "export function helper(): string {",
+        '  return "two";',
+        "}",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return !refs.items.some((item) => item.file_path === "src/consumer.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    });
+
+    fs.rmSync(path.join(workspacePath, "src/duplicate.ts"));
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return refs.items.some((item) => item.file_path === "src/consumer.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    });
+  });
+
+  it("rebuilds from watch mode when an extended tsconfig file changes", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const monorepoRoot = path.join(tempRoot, "watch-monorepo");
+    const workspacePath = path.join(monorepoRoot, "packages", "app");
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    const baseConfigPath = path.join(monorepoRoot, "tsconfig.base.json");
+    writeWorkspaceFiles(monorepoRoot, {
+      "tsconfig.base.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "packages/app/tsconfig.json": JSON.stringify(
+        {
+          extends: "../../tsconfig.base.json",
+        },
+        null,
+        2,
+      ),
+      "packages/app/src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "packages/app/src/index.ts": [
+        'import { helper as importedHelper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return importedHelper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      baseConfigPath,
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {
+              "@lib/*": ["packages/app/src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+  }, 10000);
+
+  it("rebuilds from watch mode when control paths move under ignored directories", async () => {
+    const { tempRoot, service } = createHarness(true);
+    const workspacePath = path.join(tempRoot, "watch-dynamic-config");
+    const sharedConfigPath = "node_modules/@shared/tsconfig.alias.json";
+    fs.mkdirSync(workspacePath, { recursive: true });
+
+    writeWorkspaceFiles(workspacePath, {
+      "tsconfig.local.json": JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: ".",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "tsconfig.json": JSON.stringify(
+        {
+          extends: "./tsconfig.local.json",
+        },
+        null,
+        2,
+      ),
+      "node_modules/@shared/package.json": JSON.stringify(
+        {
+          name: "@shared",
+          version: "1.0.0",
+        },
+        null,
+        2,
+      ),
+      [sharedConfigPath]: JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {
+              "@lib/*": ["src/*"],
+            },
+          },
+        },
+        null,
+        2,
+      ),
+      "src/helper.ts": [
+        "export function helper(): string {",
+        '  return "ok";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/duplicate.ts": [
+        "export function helper(): string {",
+        '  return "duplicate";',
+        "}",
+        "",
+      ].join("\n"),
+      "src/index.ts": [
+        'import { helper } from "@lib/helper";',
+        "",
+        "export function run(): string {",
+        "  return helper();",
+        "}",
+        "",
+      ].join("\n"),
+    });
+
+    const indexed = await service.indexWorkspace({ path: workspacePath });
+    const workspaceId = indexed.workspace.workspace_id;
+    const helperSymbolId = "src/helper.ts::helper#function";
+
+    const initialRefs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+    expect(initialRefs.items.map((item) => item.file_path)).toEqual(["src/helper.ts"]);
+
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      path.join(workspacePath, "tsconfig.json"),
+      JSON.stringify(
+        {
+          extends: "@shared/tsconfig.alias.json",
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+
+    await service.waitForWatcherReady(workspaceId);
+
+    fs.writeFileSync(
+      path.join(workspacePath, sharedConfigPath),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            baseUrl: "../..",
+            paths: {},
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+
+    await waitForCondition(() => {
+      const refs = service.findReferences(workspaceId, helperSymbolId, true, 20, 0);
+      return !refs.items.some((item) => item.file_path === "src/index.ts")
+        && service.getWorkspaceStatus(workspaceId).pending_change_count === 0;
+    }, 8000);
+  }, 12000);
 
   it("renames a symbol in dry-run mode and then applies the rename", async () => {
     const { tempRoot, service } = createHarness();

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 
 import chokidar, { type FSWatcher } from "chokidar";
 import fg from "fast-glob";
@@ -9,9 +10,10 @@ import type { Store } from "../db/store.js";
 import { parseFile } from "../parser/extract.js";
 import type { IndexedFile, WorkspaceConfig, WorkspaceRecord } from "../types.js";
 import type { Resolver } from "./resolver.js";
-import { readTsconfigPaths } from "./tsconfig.js";
+import { readTsconfigInfo, readTsconfigPaths, type TsconfigPaths } from "./tsconfig.js";
 import {
   DEFAULT_EXCLUDE_GLOBS,
+  getGitWatchPaths,
   MAX_FILE_BYTES,
   hashText,
   isBinaryContent,
@@ -19,16 +21,33 @@ import {
   languageFromFilePath,
   readGitRevision,
   relativeWorkspacePath,
+  toPosixPath,
 } from "./utils.js";
+
+const CONTROL_FILE_PATHS = ["tsconfig.json", "jsconfig.json"] as const;
 
 interface WorkspaceWatchState {
   watcher: FSWatcher;
   queuedChanges: Map<string, "change" | "unlink">;
   fullRefreshQueued: boolean;
+  configControlPaths: string[];
+  gitControlPaths: string[];
+  externalWatchPaths: string[];
+  ready: Promise<void>;
+  rejectReady: (error: Error) => void;
+  startupState: "pending" | "ready" | "failed";
   timer: NodeJS.Timeout | null;
 }
 
 interface DirtyWorkspaceResult {
+  changedAbsolutePaths: string[];
+  removedFilePaths: string[];
+  changedControlFiles: string[];
+  currentGitRevision: string;
+  requiresFullRebuild: boolean;
+}
+
+interface WorkspaceChangeSet {
   changedAbsolutePaths: string[];
   removedFilePaths: string[];
 }
@@ -53,6 +72,10 @@ export class Indexer {
     this.watchStates.clear();
   }
 
+  async waitForWatcherReady(workspaceId: string): Promise<void> {
+    await this.watchStates.get(workspaceId)?.ready;
+  }
+
   async performFullIndex(config: WorkspaceConfig): Promise<void> {
     const startedAt = new Date().toISOString();
     const revision = readGitRevision(config.rootPath);
@@ -67,6 +90,7 @@ export class Indexer {
       const tsconfigPaths = readTsconfigPaths(config.rootPath);
       this.resolver.rebuildRelations(config, tsconfigPaths);
       this.store.updateWorkspaceCounts(config.workspaceId);
+      this.store.replaceWorkspaceControlFileStates(config.workspaceId, this.readControlFileStates(config.rootPath));
       this.store.setWorkspaceRevision(config.workspaceId, startedAt, revision);
       this.store.setWorkspaceWatchState(config.workspaceId, this.enableWatch ? "watching" : "indexed", null);
       if (this.enableWatch) {
@@ -82,30 +106,19 @@ export class Indexer {
     }
   }
 
-  async performIncrementalRefresh(workspace: WorkspaceConfig): Promise<void> {
+  async performIncrementalRefresh(workspace: WorkspaceRecord): Promise<void> {
     this.store.setWorkspaceWatchState(workspace.workspaceId, "indexing", null);
     const dirty = this.detectDirtyWorkspace(workspace);
 
     try {
-      const changedRelPaths = dirty.changedAbsolutePaths.map(
-        (absPath) => relativeWorkspacePath(workspace.rootPath, absPath),
-      );
-      for (const absolutePath of dirty.changedAbsolutePaths) {
-        const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
-        const wasPreviouslyIndexed = this.store.getFile(workspace.workspaceId, relativePath) !== null;
-        const wasIndexed = this.indexAbsoluteFile(workspace, absolutePath);
-        if (!wasIndexed && wasPreviouslyIndexed) {
-          this.store.removeFile(workspace.workspaceId, relativePath);
-        }
+      if (dirty.requiresFullRebuild) {
+        await this.performFullIndex(workspace);
+        return;
       }
-      for (const filePath of dirty.removedFilePaths) {
-        this.store.removeFile(workspace.workspaceId, filePath);
-      }
-      const allChangedPaths = [...changedRelPaths, ...dirty.removedFilePaths];
-      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
-      this.resolver.rebuildRelationsForFiles(workspace, allChangedPaths, tsconfigPaths);
-      this.store.updateWorkspaceCounts(workspace.workspaceId);
-      this.store.setWorkspaceRevision(workspace.workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
+      this.applyWorkspaceFileChanges(workspace, {
+        changedAbsolutePaths: dirty.changedAbsolutePaths,
+        removedFilePaths: dirty.removedFilePaths,
+      });
       this.store.setWorkspaceWatchState(workspace.workspaceId, this.enableWatch ? "watching" : "indexed", null);
     } catch (error) {
       this.store.setWorkspaceWatchState(
@@ -149,7 +162,7 @@ export class Indexer {
       .sort((left, right) => left.localeCompare(right));
   }
 
-  detectDirtyWorkspace(workspace: WorkspaceConfig): DirtyWorkspaceResult {
+  detectDirtyWorkspace(workspace: WorkspaceRecord): DirtyWorkspaceResult {
     const currentFiles = this.collectWorkspaceFiles(workspace);
     const currentByPath = new Map(
       currentFiles.map((absolutePath) => {
@@ -181,7 +194,19 @@ export class Indexer {
       changedAbsolutePaths.push(remaining.absolutePath);
     }
 
-    return { changedAbsolutePaths, removedFilePaths };
+    const changedControlFiles = this.detectChangedControlFiles(workspace);
+    const currentGitRevision = readGitRevision(workspace.rootPath);
+    if (currentGitRevision !== workspace.indexedRevision) {
+      changedControlFiles.push(".git/HEAD");
+    }
+
+    return {
+      changedAbsolutePaths,
+      removedFilePaths,
+      changedControlFiles,
+      currentGitRevision,
+      requiresFullRebuild: changedControlFiles.length > 0,
+    };
   }
 
   /**
@@ -226,21 +251,129 @@ export class Indexer {
     return true;
   }
 
-  private ensureWatcher(workspace: WorkspaceConfig): void {
-    if (this.watchStates.has(workspace.workspaceId)) {
-      return;
+  applyWorkspaceFileChanges(
+    workspace: WorkspaceConfig,
+    changes: WorkspaceChangeSet,
+    options?: { updateRevision?: boolean },
+  ): void {
+    const changedFilePaths = Array.from(
+      new Set(changes.changedAbsolutePaths.map((absolutePath) => relativeWorkspacePath(workspace.rootPath, absolutePath))),
+    );
+    const removedFilePaths = Array.from(new Set(changes.removedFilePaths));
+    const trackedFilePaths = Array.from(new Set([...changedFilePaths, ...removedFilePaths]));
+
+    const previousSymbolsByFile = new Map(
+      trackedFilePaths.map((filePath) => [filePath, this.store.getFileSymbols(workspace.workspaceId, filePath)]),
+    );
+
+    for (const absolutePath of changes.changedAbsolutePaths) {
+      const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
+      const wasPreviouslyIndexed = this.store.getFile(workspace.workspaceId, relativePath) !== null;
+
+      if (!fs.existsSync(absolutePath)) {
+        if (wasPreviouslyIndexed) {
+          this.store.removeFile(workspace.workspaceId, relativePath);
+        }
+        continue;
+      }
+
+      const wasIndexed = this.indexAbsoluteFile(workspace, absolutePath);
+      if (!wasIndexed && wasPreviouslyIndexed) {
+        this.store.removeFile(workspace.workspaceId, relativePath);
+      }
     }
 
-    const watcher = chokidar.watch(workspace.rootPath, {
+    for (const filePath of removedFilePaths) {
+      this.store.removeFile(workspace.workspaceId, filePath);
+    }
+
+    const nextSymbolsByFile = new Map(
+      trackedFilePaths.map((filePath) => [filePath, this.store.getFileSymbols(workspace.workspaceId, filePath)]),
+    );
+
+    const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
+    const changedSymbolNames = this.collectChangedSymbolNames(previousSymbolsByFile, nextSymbolsByFile);
+    const directImportDependents = this.findDirectImportDependents(workspace, trackedFilePaths, tsconfigPaths);
+    const nameDependents = this.store.getFilesMentioningNames(workspace.workspaceId, changedSymbolNames);
+    const affectedPaths = Array.from(
+      new Set([...trackedFilePaths, ...directImportDependents, ...nameDependents]),
+    ).sort((left, right) => left.localeCompare(right));
+
+    this.resolver.rebuildRelationsForFiles(workspace, affectedPaths, tsconfigPaths);
+    this.store.updateWorkspaceCounts(workspace.workspaceId);
+
+    if (options?.updateRevision ?? true) {
+      this.store.setWorkspaceRevision(
+        workspace.workspaceId,
+        new Date().toISOString(),
+        readGitRevision(workspace.rootPath),
+      );
+    }
+  }
+
+  private ensureWatcher(workspace: WorkspaceConfig): void {
+    const existingState = this.watchStates.get(workspace.workspaceId);
+    if (existingState) {
+      const nextWatchConfig = this.getWatchConfig(workspace.rootPath);
+      const controlPathsChanged = !this.haveSamePaths(
+        existingState.configControlPaths,
+        nextWatchConfig.configControlPaths,
+      ) || !this.haveSamePaths(
+        existingState.gitControlPaths,
+        nextWatchConfig.gitControlPaths,
+      );
+
+      if (existingState.startupState === "failed" || controlPathsChanged) {
+        this.disposeWatcherState(workspace.workspaceId, existingState);
+      } else {
+        existingState.configControlPaths = nextWatchConfig.configControlPaths;
+        existingState.gitControlPaths = nextWatchConfig.gitControlPaths;
+
+        const pathsToAdd = nextWatchConfig.externalWatchPaths.filter(
+          (watchedPath) => !existingState.externalWatchPaths.includes(watchedPath),
+        );
+        const pathsToRemove = existingState.externalWatchPaths.filter(
+          (watchedPath) => !nextWatchConfig.externalWatchPaths.includes(watchedPath),
+        );
+
+        if (pathsToAdd.length > 0) {
+          existingState.watcher.add(pathsToAdd);
+        }
+        if (pathsToRemove.length > 0) {
+          void existingState.watcher.unwatch(pathsToRemove);
+        }
+        existingState.externalWatchPaths = nextWatchConfig.externalWatchPaths;
+        return;
+      }
+    }
+
+    const watchConfig = this.getWatchConfig(workspace.rootPath);
+    let state: WorkspaceWatchState | undefined;
+    const watcher = chokidar.watch([workspace.rootPath, ...watchConfig.externalWatchPaths], {
       ignoreInitial: true,
       awaitWriteFinish: {
         stabilityThreshold: 250,
         pollInterval: 50,
       },
       ignored: (watchedPath) => {
-        const relativePath = relativeWorkspacePath(workspace.rootPath, watchedPath);
-        if (!relativePath || relativePath.startsWith("..")) {
+        const currentState = this.watchStates.get(workspace.workspaceId) ?? state;
+        const gitControlPaths = currentState?.gitControlPaths ?? watchConfig.gitControlPaths;
+        const configControlPaths = currentState?.configControlPaths ?? watchConfig.configControlPaths;
+        const externalWatchPaths = currentState?.externalWatchPaths ?? watchConfig.externalWatchPaths;
+        const absolutePath = path.resolve(watchedPath);
+        if (
+          this.isGitControlPath(absolutePath, gitControlPaths)
+          || this.isConfigControlPath(absolutePath, configControlPaths)
+        ) {
           return false;
+        }
+
+        const relativePath = relativeWorkspacePath(workspace.rootPath, watchedPath);
+        if (!relativePath) {
+          return false;
+        }
+        if (relativePath.startsWith("..")) {
+          return !externalWatchPaths.includes(absolutePath);
         }
         if (DEFAULT_EXCLUDE_GLOBS.some((pattern) => minimatch(relativePath, pattern, { dot: true }))) {
           return true;
@@ -252,10 +385,46 @@ export class Indexer {
       },
     });
 
-    const state: WorkspaceWatchState = {
+    let readySettled = false;
+    let resolveReady!: () => void;
+    let rejectReady!: (error: Error) => void;
+    const ready = new Promise<void>((resolve, reject) => {
+      resolveReady = resolve;
+      rejectReady = reject;
+    });
+    const resolveWatcherReady = () => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      if (state) {
+        state.startupState = "ready";
+      }
+      resolveReady();
+    };
+    const rejectWatcherReady = (error: unknown) => {
+      if (readySettled) {
+        return;
+      }
+      readySettled = true;
+      if (state) {
+        state.startupState = "failed";
+      }
+      rejectReady(error instanceof Error ? error : new Error(String(error)));
+    };
+    watcher.once("ready", resolveWatcherReady);
+    void ready.catch(() => {});
+
+    state = {
       watcher,
       queuedChanges: new Map(),
       fullRefreshQueued: false,
+      configControlPaths: watchConfig.configControlPaths,
+      gitControlPaths: watchConfig.gitControlPaths,
+      externalWatchPaths: watchConfig.externalWatchPaths,
+      ready,
+      rejectReady: (error) => rejectWatcherReady(error),
+      startupState: "pending",
       timer: null,
     };
 
@@ -269,19 +438,39 @@ export class Indexer {
       }, 300);
     };
 
-    watcher.on("add", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "change");
+    const queueChange = (absolutePath: string, operation: "change" | "unlink") => {
+      const resolvedPath = path.resolve(absolutePath);
+      if (this.isGitControlPath(resolvedPath, state.gitControlPaths)) {
+        state.fullRefreshQueued = true;
+        schedule();
+        return;
+      }
+      if (this.isConfigControlPath(resolvedPath, state.configControlPaths)) {
+        state.fullRefreshQueued = true;
+        schedule();
+        return;
+      }
+
+      const relativePath = relativeWorkspacePath(workspace.rootPath, resolvedPath);
+      if (!relativePath || relativePath.startsWith("..")) {
+        return;
+      }
+
+      state.queuedChanges.set(resolvedPath, operation);
       schedule();
+    };
+
+    watcher.on("add", (absolutePath) => {
+      queueChange(absolutePath, "change");
     });
     watcher.on("change", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "change");
-      schedule();
+      queueChange(absolutePath, "change");
     });
     watcher.on("unlink", (absolutePath) => {
-      state.queuedChanges.set(absolutePath, "unlink");
-      schedule();
+      queueChange(absolutePath, "unlink");
     });
     watcher.on("error", (error) => {
+      rejectWatcherReady(error);
       state.fullRefreshQueued = true;
       this.store.setWorkspaceWatchState(
         workspace.workspaceId,
@@ -292,6 +481,26 @@ export class Indexer {
     });
 
     this.watchStates.set(workspace.workspaceId, state);
+  }
+
+  private disposeWatcherState(workspaceId: string, state: WorkspaceWatchState): void {
+    if (state.startupState === "pending") {
+      state.rejectReady(new Error(`Watcher for ${workspaceId} was disposed before becoming ready`));
+    }
+    if (state.timer) {
+      clearTimeout(state.timer);
+      state.timer = null;
+    }
+    this.watchStates.delete(workspaceId);
+    void state.watcher.close();
+  }
+
+  private haveSamePaths(left: string[], right: string[]): boolean {
+    if (left.length !== right.length) {
+      return false;
+    }
+    const rightSet = new Set(right);
+    return left.every((value) => rightSet.has(value));
   }
 
   private async flushWatchQueue(workspaceId: string): Promise<void> {
@@ -318,34 +527,24 @@ export class Indexer {
 
       this.store.setWorkspaceWatchState(workspaceId, "indexing", null);
 
-      const changedPaths: string[] = [];
+      const changedAbsolutePaths: string[] = [];
+      const removedFilePaths: string[] = [];
       for (const [absolutePath, operation] of queued) {
         const relativePath = relativeWorkspacePath(workspace.rootPath, absolutePath);
-        if (relativePath === ".git/HEAD" || relativePath === "tsconfig.json" || relativePath === "jsconfig.json") {
+        if (
+          this.isGitControlPath(path.resolve(absolutePath), state.gitControlPaths)
+          || CONTROL_FILE_PATHS.includes(relativePath as (typeof CONTROL_FILE_PATHS)[number])
+        ) {
           await this.performFullIndex(workspace);
           return;
         }
         if (operation === "unlink") {
-          changedPaths.push(relativePath);
-          this.store.removeFile(workspaceId, relativePath);
+          removedFilePaths.push(relativePath);
           continue;
         }
-        if (!fs.existsSync(absolutePath)) {
-          continue;
-        }
-        changedPaths.push(relativePath);
-        const wasPreviouslyIndexed = this.store.getFile(workspaceId, relativePath) !== null;
-        const wasIndexed = this.indexAbsoluteFile(workspace, absolutePath);
-        // If indexAbsoluteFile skipped the file (non-indexable language, secret,
-        // oversized, binary) but it was previously indexed, remove the stale entry.
-        if (!wasIndexed && wasPreviouslyIndexed) {
-          this.store.removeFile(workspaceId, relativePath);
-        }
+        changedAbsolutePaths.push(absolutePath);
       }
-      const tsconfigPaths = readTsconfigPaths(workspace.rootPath);
-      this.resolver.rebuildRelationsForFiles(workspace, changedPaths, tsconfigPaths);
-      this.store.updateWorkspaceCounts(workspaceId);
-      this.store.setWorkspaceRevision(workspaceId, new Date().toISOString(), readGitRevision(workspace.rootPath));
+      this.applyWorkspaceFileChanges(workspace, { changedAbsolutePaths, removedFilePaths });
       this.store.setWorkspaceWatchState(workspaceId, "watching", null);
     } catch (error) {
       // Restore queued changes so they can be retried on the next flush
@@ -363,5 +562,136 @@ export class Indexer {
         error instanceof Error ? error.message : String(error),
       );
     }
+  }
+
+  private detectChangedControlFiles(workspace: WorkspaceConfig): string[] {
+    const previousStates = new Map(this.store.getWorkspaceControlFileStates(workspace.workspaceId).map((state) => [state.filePath, state] as const));
+    const currentStates = new Map(this.readControlFileStates(workspace.rootPath).map((state) => [state.filePath, state] as const));
+    const controlFilePaths = Array.from(new Set([...previousStates.keys(), ...currentStates.keys()]));
+
+    return controlFilePaths
+      .filter((filePath) => {
+        const previous = previousStates.get(filePath);
+        const current = currentStates.get(filePath);
+        return (
+          previous?.isPresent !== current?.isPresent
+          || previous?.contentHash !== current?.contentHash
+        );
+      })
+      .sort((left, right) => left.localeCompare(right));
+  }
+
+  private readControlFileStates(rootPath: string): Array<{ filePath: string; isPresent: boolean; contentHash: string | null }> {
+    const rootControlPaths = CONTROL_FILE_PATHS.map((filePath) => path.join(rootPath, filePath));
+    const tsconfigInfo = readTsconfigInfo(rootPath);
+    const controlPaths = Array.from(new Set([...rootControlPaths, ...tsconfigInfo.configFiles]));
+
+    return controlPaths.map((absolutePath) => {
+      const filePath = this.controlFilePath(rootPath, absolutePath);
+      if (!fs.existsSync(absolutePath)) {
+        return {
+          filePath,
+          isPresent: false,
+          contentHash: null,
+        };
+      }
+
+      return {
+        filePath,
+        isPresent: true,
+        contentHash: hashText(fs.readFileSync(absolutePath, "utf8")),
+      };
+    });
+  }
+
+  private findDirectImportDependents(
+    workspace: WorkspaceConfig,
+    targetFilePaths: string[],
+    tsconfigPaths?: TsconfigPaths | null,
+  ): string[] {
+    if (targetFilePaths.length === 0) {
+      return [];
+    }
+
+    const files = this.store.getFiles(workspace.workspaceId);
+    const knownFiles = new Set(files.map((file) => file.filePath));
+    const targets = new Set(targetFilePaths);
+    const resolutionFileSet = new Set([...knownFiles, ...targetFilePaths]);
+    const dependents = new Set<string>();
+
+    for (const file of files) {
+      if (targets.has(file.filePath)) {
+        continue;
+      }
+
+      for (const binding of file.imports) {
+        const resolvedTarget = this.resolver.resolveImportTargetFilePath(
+          workspace,
+          file,
+          binding,
+          resolutionFileSet,
+          tsconfigPaths,
+        );
+        if (resolvedTarget && targets.has(resolvedTarget)) {
+          dependents.add(file.filePath);
+          break;
+        }
+      }
+    }
+
+    return Array.from(dependents).sort((left, right) => left.localeCompare(right));
+  }
+
+  private isGitControlPath(absolutePath: string, gitControlPaths: string[]): boolean {
+    return gitControlPaths.some(
+      (controlPath) => absolutePath === controlPath || absolutePath.startsWith(`${controlPath}${path.sep}`),
+    );
+  }
+
+  private isConfigControlPath(absolutePath: string, configControlPaths: string[]): boolean {
+    return configControlPaths.some(
+      (controlPath) => absolutePath === controlPath || controlPath.startsWith(`${absolutePath}${path.sep}`),
+    );
+  }
+
+  private controlFilePath(rootPath: string, absolutePath: string): string {
+    const relativePath = relativeWorkspacePath(rootPath, absolutePath);
+    return !relativePath || relativePath.startsWith("..") ? toPosixPath(absolutePath) : relativePath;
+  }
+
+  private getWatchConfig(rootPath: string): {
+    configControlPaths: string[];
+    gitControlPaths: string[];
+    externalWatchPaths: string[];
+  } {
+    const gitControlPaths = getGitWatchPaths(rootPath).map((watchedPath) => path.resolve(watchedPath));
+    const configControlPaths = readTsconfigInfo(rootPath).configFiles.map((watchedPath) => path.resolve(watchedPath));
+    const externalConfigWatchPaths = configControlPaths
+      .filter((controlPath) => relativeWorkspacePath(rootPath, controlPath).startsWith(".."))
+      .map((controlPath) => (fs.existsSync(controlPath) ? controlPath : path.dirname(controlPath)));
+
+    return {
+      configControlPaths,
+      gitControlPaths,
+      externalWatchPaths: Array.from(new Set([...gitControlPaths, ...externalConfigWatchPaths])),
+    };
+  }
+
+  private collectChangedSymbolNames(
+    previousSymbolsByFile: Map<string, Array<{ name: string }>>,
+    nextSymbolsByFile: Map<string, Array<{ name: string }>>,
+  ): string[] {
+    const names = new Set<string>();
+    for (const symbols of previousSymbolsByFile.values()) {
+      for (const symbol of symbols) {
+        names.add(symbol.name);
+      }
+    }
+    for (const symbols of nextSymbolsByFile.values()) {
+      for (const symbol of symbols) {
+        names.add(symbol.name);
+      }
+    }
+    return Array.from(names).sort((left, right) => left.localeCompare(right));
   }
 }

@@ -15,6 +15,7 @@ interface CliOptions {
   port: number;
   dbPath?: string;
   disableWatch: boolean;
+  enableRefactors: boolean;
 }
 
 function parseArgs(argv: string[]): CliOptions {
@@ -23,6 +24,7 @@ function parseArgs(argv: string[]): CliOptions {
     host: "127.0.0.1",
     port: 3333,
     disableWatch: false,
+    enableRefactors: false,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -47,6 +49,9 @@ function parseArgs(argv: string[]): CliOptions {
       case "--disable-watch":
         options.disableWatch = true;
         break;
+      case "--enable-refactors":
+        options.enableRefactors = true;
+        break;
       default:
         break;
     }
@@ -55,18 +60,18 @@ function parseArgs(argv: string[]): CliOptions {
   return options;
 }
 
-async function runStdio(service: CodeIntelService): Promise<void> {
-  const server = createCodeIntelMcpServer(service);
+async function runStdio(service: CodeIntelService, enableRefactors: boolean): Promise<void> {
+  const server = createCodeIntelMcpServer(service, { enableRefactors });
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error("codeintel-mcp-server listening on stdio");
 }
 
-async function runHttp(service: CodeIntelService, host: string, port: number): Promise<void> {
+async function runHttp(service: CodeIntelService, host: string, port: number, enableRefactors: boolean): Promise<void> {
   const app = createMcpExpressApp({ host });
 
   app.post("/mcp", async (req, res) => {
-    const server = createCodeIntelMcpServer(service);
+    const server = createCodeIntelMcpServer(service, { enableRefactors });
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
     });
@@ -139,11 +144,11 @@ async function main(): Promise<void> {
   });
 
   if (options.transport === "http") {
-    await runHttp(service, options.host, options.port);
+    await runHttp(service, options.host, options.port, options.enableRefactors);
     return;
   }
 
-  await runStdio(service);
+  await runStdio(service, options.enableRefactors);
 }
 
 main().catch((error) => {

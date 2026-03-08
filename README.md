@@ -26,7 +26,7 @@ It is optimized for personal, local workflows first, with a clean path to remote
 ### 1. Install
 
 ```bash
-npm install
+npm ci
 npm run build
 ```
 
@@ -46,6 +46,7 @@ Optional runtime flags:
 
 - `--db-path /custom/path/codeintel.sqlite`
 - `--disable-watch`
+- `--enable-refactors` to expose experimental rename / move tools
 
 ## Highlights
 
@@ -57,6 +58,7 @@ Optional runtime flags:
 | Workspace search | Text hits with file, line, and column |
 | Reference tracing | Imports, direct usages, and call sites resolved heuristically |
 | Call graph traversal | Upstream callers and downstream callees |
+| Parse diagnostics | Workspace-level parse issue counts plus per-file recovery warnings |
 | Local-first indexing | JS, TS, TSX, and Python support |
 | Fast local storage | SQLite + FTS5 |
 | MCP transport options | `stdio` and local Streamable HTTP |
@@ -69,6 +71,8 @@ Optional runtime flags:
 - Python
 
 ## Tool Catalog
+
+Default read-only MCP surface:
 
 | Tool | Purpose |
 | --- | --- |
@@ -84,6 +88,23 @@ Optional runtime flags:
 | `codeintel_find_references` | Find resolved references to a symbol |
 | `codeintel_find_callers` | Traverse incoming call edges |
 | `codeintel_find_callees` | Traverse outgoing call edges |
+
+Experimental opt-in tools:
+
+- `codeintel_rename_symbol`
+- `codeintel_move_symbol`
+
+These are only exposed when the server starts with `--enable-refactors`.
+
+## Resource Catalog
+
+| Resource | Purpose |
+| --- | --- |
+| `codeintel://workspaces` | List indexed workspaces |
+| `codeintel://workspace/{workspaceId}` | Workspace detail and status |
+| `codeintel://workspace/{workspaceId}/files` | Indexed file listing |
+| `codeintel://workspace/{workspaceId}/file/{filePath}` | File content, parse warning, and outline |
+| `codeintel://workspace/{workspaceId}/symbol/{symbolId}` | Symbol detail payload |
 
 ## MCP Client Config
 
@@ -103,6 +124,8 @@ Claude Code / Claude Desktop:
   }
 }
 ```
+
+Add `--enable-refactors` to the server args only if you want the experimental rename and move tools.
 
 ## Typical Workflows
 
@@ -137,6 +160,7 @@ Local workspace
 ## Local Development
 
 ```bash
+npm run lint
 npm run typecheck
 npm test
 npm run build
@@ -144,15 +168,19 @@ npm run build
 
 The repo includes fixed fixture workspaces under `tests/fixtures/` that validate:
 
+- JavaScript indexing and parse recovery reporting
 - TypeScript symbol extraction and callers
 - TSX parsing and text search
 - Python method calls and references
 - incremental refresh after source changes
+- name-based invalidation across refresh and watch mode
+- MCP tool and resource behavior over an in-memory client/server transport
 
 ## Verification Status
 
 Verified locally with:
 
+- `npm run lint`
 - `npm run typecheck`
 - `npm test`
 - `npm run build`
@@ -161,20 +189,25 @@ Verified locally with:
 
 ## Current Scope
 
-This version is intentionally focused on local, read-only intelligence.
+This version is intentionally focused on local, read-only intelligence by default.
 
 Included:
 
 - local workspace indexing
 - precise symbol retrieval
 - search, references, and call traversal
+- parse recovery diagnostics
 - live freshness
+
+Experimental opt-in:
+
+- rename and move symbol tools behind `--enable-refactors`
 
 Not included yet:
 
 - GitHub remote indexing
 - semantic / embedding search
-- edit or refactor tools
+- default write-enabled workflows
 - multi-user auth and hosted deployment workflows
 
 ## Evaluations
